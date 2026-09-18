@@ -1060,7 +1060,17 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        _step_trace = os.environ.get("VLLM_TTFT_STEP_TRACE", "0") == "1"
+        if _step_trace:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
+        out = self.model_runner.sample_tokens(grammar_output)
+        if _step_trace:
+            torch.cuda.synchronize()
+            _dt = time.perf_counter() - _t0
+            if get_tp_group().rank == 0:
+                logger.info("[TTFT_STEP] sample_tokens gpu_ms=%.2f", _dt * 1000.0)
+        return out
 
     @torch.inference_mode()
     @with_gpu_sync_check
@@ -1124,9 +1134,22 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
+            _step_trace = os.environ.get("VLLM_TTFT_STEP_TRACE", "0") == "1"
+            if _step_trace:
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if _step_trace:
+                torch.cuda.synchronize()
+                _dt = time.perf_counter() - _t0
+                if get_tp_group().rank == 0:
+                    logger.info(
+                        "[TTFT_STEP] execute_model tokens=%s gpu_ms=%.2f",
+                        num_scheduled_tokens,
+                        _dt * 1000.0,
+                    )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

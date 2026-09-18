@@ -14,6 +14,8 @@ from math import prod
 from typing import TYPE_CHECKING, TypeVar
 
 import torch
+
+import vllm.envs as envs
 from typing_extensions import Self
 
 from vllm.logger import init_logger
@@ -530,10 +532,17 @@ class FullAttentionSpec(AttentionSpec):
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
-    if spec.alignment is None:
+    alignment = spec.alignment
+    if envs.VLLM_DSV4_PREFILL_ASM and spec.model_version == "deepseek_v4":
+        # The assembly prefill kernel turns a token index into a byte offset via
+        # whole 576B rows, so a page has to be a whole number of them. Every DSv4
+        # cache it reads is padded here rather than at each spec's own site,
+        # since the caller that built the spec is not the one that reads it.
+        alignment = 576
+    if alignment is None:
         return
     actual_page_size = spec.real_page_size_bytes
-    padded_page_size = round_up(actual_page_size, spec.alignment)
+    padded_page_size = round_up(actual_page_size, alignment)
     if padded_page_size != actual_page_size:
         object.__setattr__(spec, "page_size_padded", padded_page_size)
 

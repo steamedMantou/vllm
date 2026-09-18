@@ -7,6 +7,7 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -29,11 +30,28 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.ops.pcp import gather_prefill_cache_inputs
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+
+
+# The two-stage compressor scratch is a per-call intermediate and the layers
+# using it run sequentially, so one buffer is shared by every compressor on the
+# device. Under PCP it is sized for the post-all-gather token count, which is
+# pcp_size times larger and too big to afford once per layer.
+_COMPRESS_SCRATCH: dict[tuple[str, int], torch.Tensor] = {}
+
+
+def _get_compress_scratch(num_tokens: int, head_dim: int, device: str) -> torch.Tensor:
+    key = (device, head_dim)
+    scratch = _COMPRESS_SCRATCH.get(key)
+    if scratch is None or scratch.shape[0] < num_tokens:
+        scratch = torch.empty(num_tokens, head_dim, dtype=torch.float32, device=device)
+        _COMPRESS_SCRATCH[key] = scratch
+    return scratch
 
 
 def _prefer_two_stage_compressor() -> bool:
@@ -62,6 +80,10 @@ class CompressorBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "CompressorBackend"
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -222,6 +244,7 @@ class DeepseekCompressor(nn.Module):
         self.use_fp4_cache = use_fp4_cache
 
         config = vllm_config.model_config.hf_config
+        self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.rms_norm_eps = config.rms_norm_eps
@@ -244,11 +267,13 @@ class DeepseekCompressor(nn.Module):
         )
         self._compress_scratch: torch.Tensor | None = None
         if self._use_two_stage_fused_compressor:
-            self._compress_scratch = torch.empty(
-                self.max_num_batched_tokens,
+            # Under PCP the compressor runs after the all-gather, so it sees up
+            # to pcp_size times the per-rank token budget.
+            self._compress_scratch = _get_compress_scratch(
+                self.max_num_batched_tokens
+                * vllm_config.parallel_config.prefill_context_parallel_size,
                 self.head_dim,
-                dtype=torch.float32,
-                device=self.device,
+                self.device,
             )
 
         state_dtype = torch.float32
@@ -306,6 +331,27 @@ class DeepseekCompressor(nn.Module):
                 f"Unsupported head_dim for fused quant+cache: {self.head_dim}"
             )
 
+    def pcp_prefill_payload(self, kv_score: torch.Tensor) -> torch.Tensor | None:
+        """Return this compressor's large PCP payload before its gather.
+
+        C4 has both the main compressor and its indexer compressor ready at the
+        same point in the attention forward. The caller can batch these two
+        independent suffix gathers, then pass the resulting rank-major tensor
+        back to ``forward``. All metadata and cache writes remain local here.
+        """
+        if not self.use_pcp:
+            return None
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return None
+        state_metadata = cast(
+            CompressorMetadata, attn_metadata[self.state_cache.prefix]
+        )
+        num_decode_tokens = state_metadata.num_decode_tokens
+        if num_decode_tokens is None or num_decode_tokens >= kv_score.shape[0]:
+            return None
+        return kv_score[num_decode_tokens:].contiguous()
+
     def forward(
         self,
         # [num_tokens, 2 * self.coff * self.head_dim]
@@ -313,6 +359,7 @@ class DeepseekCompressor(nn.Module):
         # [num_tokens]
         positions: torch.Tensor,
         rotary_emb,
+        pcp_gathered_payload: torch.Tensor | None = None,
     ) -> None:
         # Each of shape [num_tokens, coff * self.head_dim]
         # input bf16, output are fp32
@@ -331,7 +378,54 @@ class DeepseekCompressor(nn.Module):
         )
         token_to_req_indices = state_metadata.token_to_req_indices
         slot_mapping = state_metadata.slot_mapping
+        if self.use_pcp:
+            assert token_to_req_indices is not None
+            assert state_metadata.num_decode_tokens is not None
+            # The rank-local batch is padded up to the largest rank's token
+            # count so the collectives below see uniform shapes, but the
+            # attention metadata is built from the unpadded count. Pad rows
+            # carry PAD_SLOT_ID, so their request index is never read.
+            num_pad_rows = kv_score.shape[0] - token_to_req_indices.shape[0]
+            if num_pad_rows > 0:
+                token_to_req_indices = torch.cat(
+                    (token_to_req_indices, token_to_req_indices.new_zeros(num_pad_rows))
+                )
+            # DSV4's compressor owns both the intermediate state write and the
+            # final C4/C128/indexer cache write. Materialize every rank's
+            # prefill projections before either write so each PCP process keeps
+            # a complete private cache, while retaining one local copy of
+            # replicated decode rows.
+            (
+                (kv_score, positions, token_to_req_indices),
+                slot_mapping,
+            ) = gather_prefill_cache_inputs(
+                (kv_score, positions, token_to_req_indices),
+                slot_mapping,
+                state_metadata.num_decode_tokens,
+                descriptor_key=state_metadata,
+                trace_label=f"compressor_c{self.compress_ratio}",
+                gathered_payload_0=pcp_gathered_payload,
+            )
+            kv, score = kv_score.split(
+                [self.coff * self.head_dim, self.coff * self.head_dim], dim=-1
+            )
         num_actual = slot_mapping.shape[0]
+        if self.use_pcp:
+            # num_actual drives the grid for every per-token tensor below, so a
+            # gather that returns mismatched row counts reads past the shorter
+            # ones.
+            assert (
+                kv.shape[0] == num_actual
+                and score.shape[0] == num_actual
+                and positions.shape[0] == num_actual
+                and token_to_req_indices is not None
+                and token_to_req_indices.shape[0] == num_actual
+            ), (
+                f"PCP gather row mismatch: slot_mapping={num_actual} "
+                f"kv={kv.shape[0]} score={score.shape[0]} "
+                f"positions={positions.shape[0]} "
+                f"token_to_req={token_to_req_indices.shape[0]}"
+            )
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
 
@@ -417,10 +511,30 @@ class DeepseekCompressor(nn.Module):
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
             assert state_metadata.num_decode_tokens is not None
+            # The scratch is sized from max_num_batched_tokens, but under PCP
+            # num_actual is the post-all-gather count (up to pcp_size times
+            # larger), so the two are no longer guaranteed to match.
+            assert self._compress_scratch is not None
+            assert num_actual <= self._compress_scratch.shape[0], (
+                f"compress scratch holds {self._compress_scratch.shape[0]} rows "
+                f"but num_actual is {num_actual} "
+                f"(decode={state_metadata.num_decode_tokens}, use_pcp={self.use_pcp})"
+            )
+            boundary_indices = (
+                forward_context.pcp_c128_boundary_indices
+                if (
+                    envs.VLLM_DSV4_C128_COMPACT
+                    and self.use_pcp
+                    and self.compress_ratio == 128
+                    and state_metadata.num_decode_tokens == 0
+                )
+                else None
+            )
             compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
             extra_kwargs = {
                 "num_decode_tokens": state_metadata.num_decode_tokens,
                 "compress_scratch": self._compress_scratch,
+                "boundary_indices": boundary_indices,
             }
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).

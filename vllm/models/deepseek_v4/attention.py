@@ -4,8 +4,10 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from functools import cache
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -26,6 +28,7 @@ from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
 )
+from vllm.models.deepseek_v4.common.ops.cache_utils import rope_and_insert_k_cache
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 
 if TYPE_CHECKING:
@@ -47,6 +50,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -59,6 +63,21 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.ops.pcp import (
+    coalesced_pcp_all_gather_payloads,
+    gather_prefill_cache_inputs,
+)
+
+
+@cache
+def _pcp_swa_gather() -> bool:
+    """Escape hatch for the PCP SWA cache gather (VLLM_DSV4_PCP_SWA_GATHER=0).
+
+    Off leaves each rank holding only its own shard of the sliding-window
+    cache, which is not correct -- it exists to tell whether this path is
+    implicated in a numerical problem, not as a supported configuration.
+    """
+    return os.getenv("VLLM_DSV4_PCP_SWA_GATHER", "1") != "0"
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -190,6 +209,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         quant_config = vllm_config.quant_config
         cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()
+        self.use_pcp = (
+            vllm_config.parallel_config.prefill_context_parallel_size > 1
+        )
         layer_id = extract_layer_index(prefix)
 
         self.prefix = prefix  # Alias for compatibility with compressor
@@ -460,6 +482,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         indexer = self.indexer
         compressor = self.compressor
         aux_streams = self.aux_stream_list
+        pcp_gathered_main_payload: torch.Tensor | None = None
+        pcp_gathered_indexer_payload: torch.Tensor | None = None
 
         def project_query_and_cache_kv() -> torch.Tensor:
             q = self._wq_b_proj(qr, qr_scale).view(
@@ -474,7 +498,59 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Keep Q projection and KV insertion on the default stream. The indexer
         # and MLA compressor use aux streams 0 and 1; aux 2 is internal to the
         # indexer. ROCm runs the same work sequentially without aux streams.
-        if indexer is not None:
+        use_staged_c4_gather = (
+            self.use_pcp
+            and aux_streams is None
+            and indexer is not None
+            and compressor is not None
+            and compressor.compress_ratio == 4
+            and indexer.compressor.compress_ratio == 4
+            and envs.VLLM_DSV4_C4_COALESCED_ALLGATHER
+            and not torch.compiler.is_compiling()
+        )
+        if use_staged_c4_gather:
+            # Preserve the original default-stream ordering: Q projection and
+            # local KV insert complete before either compressor cache write.
+            # The two large prefill suffixes are then staged and collected in
+            # one ProcessGroup batch before their independent consumers run.
+            q = project_query_and_cache_kv()
+            assert indexer is not None and compressor is not None
+            main_payload = compressor.pcp_prefill_payload(kv_score)
+            indexer_payload = indexer.compressor.pcp_prefill_payload(
+                indexer_kv_score
+            )
+            if main_payload is not None and indexer_payload is not None:
+                assert main_payload.shape[0] == indexer_payload.shape[0], (
+                    "C4 main/indexer prefill row mismatch: "
+                    f"{main_payload.shape[0]} != {indexer_payload.shape[0]}"
+                )
+                gathered_payloads = coalesced_pcp_all_gather_payloads(
+                    (indexer_payload, main_payload),
+                    trace_label="compressor_c4:coalesced_main_and_indexer_payloads",
+                )
+                if gathered_payloads is not None:
+                    (
+                        pcp_gathered_indexer_payload,
+                        pcp_gathered_main_payload,
+                    ) = gathered_payloads
+            indexer_inputs = indexer(
+                hidden_states,
+                qr,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+                qr_scale,
+                pcp_gathered_payload=pcp_gathered_indexer_payload,
+            )
+            compressor(
+                kv_score,
+                positions,
+                self.rotary_emb,
+                pcp_gathered_payload=pcp_gathered_main_payload,
+            )
+            index_q, index_q_scale, index_weights_out = indexer_inputs
+        elif indexer is not None:
             assert compressor is not None
             q, (indexer_inputs, _) = execute_in_parallel(
                 project_query_and_cache_kv,
@@ -487,8 +563,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         positions,
                         self.indexer_rotary_emb,
                         qr_scale,
+                        pcp_gathered_payload=pcp_gathered_indexer_payload,
                     ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    lambda: compressor(
+                        kv_score,
+                        positions,
+                        self.rotary_emb,
+                        pcp_gathered_payload=pcp_gathered_main_payload,
+                    ),
                 ],
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
@@ -500,7 +582,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_stream = aux_streams[0] if aux_streams is not None else None
             q, _ = maybe_execute_in_parallel(
                 project_query_and_cache_kv,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
+                lambda: compressor(
+                    kv_score,
+                    positions,
+                    self.rotary_emb,
+                    pcp_gathered_payload=pcp_gathered_main_payload,
+                ),
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
@@ -673,7 +760,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q_out = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
@@ -684,6 +771,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.eps,
                 swa_metadata.block_size,
             )
+            if self.use_pcp and current_platform.is_rocm() and _pcp_swa_gather():
+                (
+                    (full_kv, full_positions),
+                    full_slot_mapping,
+                ) = gather_prefill_cache_inputs(
+                    (kv, positions),
+                    swa_metadata.slot_mapping,
+                    swa_metadata.num_decode_tokens,
+                    descriptor_key=swa_metadata,
+                    trace_label="swa_cache",
+                )
+                if full_kv.shape[0] > swa_metadata.num_decode_tokens:
+                    # The fused op above produces rank-local Q. Materialize the
+                    # gathered KV separately so every PCP process owns the full
+                    # SWA cache without allocating a gathered [T,H,D] dummy Q.
+                    rope_and_insert_k_cache(
+                        full_kv,
+                        full_positions,
+                        cos_sin_cache,
+                        swa_kv_cache,
+                        full_slot_mapping,
+                        swa_metadata.block_size,
+                        self.rope_head_dim,
+                    )
+            return q_out
 
         # Plain-row path: the [num_blocks, block_size, 512] cache stores the KV
         # row in its element dtype (no Q padding). bf16 rewrites q in place;
@@ -838,6 +950,12 @@ class DeepseekV4Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
+        # Block scale for the preshuffled weight, set at load on ROCm by the
+        # owning attention layer; None = not preshuffled.
+        self._wq_b_scale: torch.Tensor | None = None
+        # The parent may transpose the shared q scale for its own preshuffled
+        # wq_b while this indexer stays on the regular path.
+        self._wq_b_input_scale_transposed = False
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
@@ -919,6 +1037,7 @@ class DeepseekV4Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
         qr_scale: torch.Tensor | None = None,
+        pcp_gathered_payload: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         compressor = self.compressor
 
@@ -931,13 +1050,25 @@ class DeepseekV4Indexer(nn.Module):
             ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
-                compressor(compressed_kv_score, positions, rotary_emb)
+                compressor(
+                    compressed_kv_score,
+                    positions,
+                    rotary_emb,
+                    pcp_gathered_payload=pcp_gathered_payload,
+                )
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
                     indexer_metadata.num_decode_tokens
                     + indexer_metadata.num_prefill_tokens
                 )
                 if num_tokens > 0:
+                    # Under PCP num_tokens is the post-all-gather count, which
+                    # the buffer must have been sized for.
+                    assert num_tokens <= self.topk_indices_buffer.shape[0], (
+                        f"topk_indices_buffer holds "
+                        f"{self.topk_indices_buffer.shape[0]} rows but "
+                        f"num_tokens is {num_tokens}"
+                    )
                     _fill_short_context_topk_indices[(num_tokens,)](
                         self.topk_indices_buffer,
                         positions,
@@ -965,7 +1096,12 @@ class DeepseekV4Indexer(nn.Module):
         # join orders that write before indexer_op (skip_k_cache_insert=True).
         (q_quant, weights), _ = maybe_execute_in_parallel(
             wq_b_and_q_quant,
-            lambda: compressor(compressed_kv_score, positions, rotary_emb),
+            lambda: compressor(
+                compressed_kv_score,
+                positions,
+                rotary_emb,
+                pcp_gathered_payload=pcp_gathered_payload,
+            ),
             self.ln_events[0],
             self.ln_events[1],
             self.aux_stream,
@@ -989,6 +1125,17 @@ class DeepseekV4Indexer(nn.Module):
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             return q
+        if self._wq_b_scale is not None:
+            from vllm.models.deepseek_v4.amd.rocm import (
+                apply_bpreshuffle_block_scaled_mm,
+            )
+
+            output = apply_bpreshuffle_block_scaled_mm(
+                self.wq_b, qr, qr_scale, self._wq_b_scale
+            )
+            return output
+        if self._wq_b_input_scale_transposed:
+            qr_scale = qr_scale.t().contiguous()
         from vllm.models.deepseek_v4.amd.rocm import (
             apply_pre_quantized_block_scaled_mm,
         )

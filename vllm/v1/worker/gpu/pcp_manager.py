@@ -6,10 +6,13 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
+from vllm.platforms import current_platform
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.ops.pcp import pcp_comm_trace
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -70,6 +73,8 @@ class PCPManager:
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
+        self._gathered_is_padding: torch.Tensor | None = None
+        self._pcp_c128_boundary_indices: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
         max_num_local_reqs = 2 * max_num_reqs if max_num_reqs is not None else None
@@ -216,15 +221,28 @@ class PCPManager:
                 continue
             chunk_indices: tuple[int, ...]
             if bool(is_prefilling[global_batch_req_idx]):
-                chunk_size = (query_len + num_chunks - 1) // num_chunks
-                chunk_indices = (rank, num_chunks - 1 - rank)
+                if query_len < num_chunks:
+                    # Match SGLang's short-sequence fallback: a non-degenerate
+                    # zigzag needs at least 2 * PCP tokens. Replication keeps
+                    # every rank's request layout and collective shapes equal,
+                    # which is also required by one-token warmup batches.
+                    chunk_size = query_len
+                    chunk_indices = (0,)
+                else:
+                    chunk_size = 0
+                    chunk_indices = (rank, num_chunks - 1 - rank)
             else:  # decodes are replicated
                 chunk_size = query_len
                 chunk_indices = (0,)
 
             for chunk_idx in chunk_indices:
-                chunk_offset = chunk_idx * chunk_size
-                chunk_len = min(chunk_size, query_len - chunk_offset)
+                if bool(is_prefilling[global_batch_req_idx]) and query_len >= num_chunks:
+                    base, extra = divmod(query_len, num_chunks)
+                    chunk_offset = chunk_idx * base + min(chunk_idx, extra)
+                    chunk_len = base + int(chunk_idx < extra)
+                else:
+                    chunk_offset = chunk_idx * chunk_size
+                    chunk_len = min(chunk_size, query_len - chunk_offset)
                 if chunk_len <= 0:
                     continue
                 yield global_batch_req_idx, chunk_offset, chunk_len
@@ -348,6 +366,66 @@ class PCPManager:
             )
             for rank in range(self.pcp_world_size)
         )
+
+    def _get_gathered_is_padding(
+        self, per_rank_num_tokens: list[int], padded_num_tokens: int
+    ) -> torch.Tensor:
+        """Build the rank-major padding mask without a per-MoE all-gather."""
+        num_tokens = padded_num_tokens * self.pcp_world_size
+        buffer = self._gathered_is_padding
+        if buffer is None or buffer.numel() < num_tokens:
+            buffer = torch.empty(num_tokens, dtype=torch.bool, device=self.device)
+            self._gathered_is_padding = buffer
+        result = buffer[:num_tokens]
+        result.fill_(True)
+        for rank, num_rank_tokens in enumerate(per_rank_num_tokens):
+            result[
+                rank * padded_num_tokens : rank * padded_num_tokens + num_rank_tokens
+            ].fill_(False)
+        return result
+
+    def _get_c128_boundary_indices(
+        self,
+        segments_by_rank: list[list[RankSegment]],
+        num_computed_tokens: np.ndarray,
+        query_start_loc_np: np.ndarray,
+        padded_num_tokens: int,
+    ) -> torch.Tensor:
+        """Map every C128-ending row into rank-major gather order on the CPU.
+
+        A PCP rank has up to two contiguous zigzag segments per request. Their
+        start positions are already available on the CPU while partitioning,
+        which avoids a device-side ``nonzero`` plus an otherwise unavoidable
+        host synchronization in every C128 layer.
+        """
+        indices: list[int] = []
+        for rank, segments in enumerate(segments_by_rank):
+            rank_base = rank * padded_num_tokens
+            for segment in segments:
+                request_index = segment.global_batch_req_idx
+                start_position = (
+                    int(num_computed_tokens[request_index])
+                    + segment.global_batch_slice.start
+                    - int(query_start_loc_np[request_index])
+                )
+                first_boundary_offset = (-start_position - 1) % 128
+                for offset in range(
+                    first_boundary_offset, segment.num_tokens, 128
+                ):
+                    indices.append(
+                        rank_base + segment.rank_local_batch_slice.start + offset
+                    )
+
+        buffer = self._pcp_c128_boundary_indices
+        if buffer is None or buffer.numel() < len(indices):
+            buffer = torch.empty(
+                max(1, len(indices)), dtype=torch.int64, device=self.device
+            )
+            self._pcp_c128_boundary_indices = buffer
+        result = buffer[: len(indices)]
+        if indices:
+            async_copy_to_gpu(np.asarray(indices, dtype=np.int64), out=result)
+        return result
 
     @property
     def input_buffers(self) -> InputBuffers:
@@ -493,6 +571,9 @@ class PCPManager:
         is_padding = input_buffers.is_padding[:num_local_tokens_padded]
         is_padding[:num_local_tokens].fill_(False)
         is_padding[num_local_tokens:].fill_(True)
+        pcp_gathered_is_padding = self._get_gathered_is_padding(
+            per_rank_num_tokens, num_local_tokens_padded
+        )
         if num_local_tokens_padded > num_local_tokens:
             input_buffers.input_ids[:num_local_tokens_padded].masked_fill_(
                 is_padding, 0
@@ -534,6 +615,18 @@ class PCPManager:
         local_is_prefilling_np = (
             local_num_computed_prefill_tokens_np < local_prefill_len_np
         )
+        pcp_c128_boundary_indices = None
+        if (
+            envs.VLLM_DSV4_C128_COMPACT
+            and num_local_tokens > 0
+            and bool(local_is_prefilling_np.all())
+        ):
+            pcp_c128_boundary_indices = self._get_c128_boundary_indices(
+                segments_by_rank,
+                num_computed_tokens,
+                global_batch.query_start_loc_np,
+                num_local_tokens_padded,
+            )
         seq_lens_cpu_upper_bound_np = np.zeros(num_local_reqs, dtype=np.int32)
         seq_lens_cpu_upper_bound_np[:] = local_start_pos_np + local_num_scheduled_tokens
 
@@ -581,6 +674,8 @@ class PCPManager:
             input_ids=input_buffers.input_ids[:num_local_tokens_padded],
             positions=input_buffers.positions[:num_local_tokens_padded],
             is_padding=is_padding,
+            pcp_gathered_is_padding=pcp_gathered_is_padding,
+            pcp_c128_boundary_indices=pcp_c128_boundary_indices,
             logits_indices=logits_indices,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -599,8 +694,47 @@ class PCPManager:
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
         )
-        slot_mappings = self.prepare_slot_mappings()
+        # Generic MLA consumes the rank-major gathered slot map. DeepSeek-V4's
+        # ROCm fused Q/KV insert consumes one slot per local Q row instead; build
+        # that mapping directly from the global batch so replicated decode rows
+        # remain writable on every process (the gathered map intentionally masks
+        # decode copies on PCP ranks > 0).
+        slot_mappings = (
+            self.prepare_local_slot_mappings(input_batch)
+            if current_platform.is_rocm()
+            else self.prepare_slot_mappings()
+        )
         return block_tables, slot_mappings
+
+    def prepare_local_slot_mappings(self, input_batch: InputBatch) -> torch.Tensor:
+        assert self._block_tables is not None
+        assert self._global_batch_slot_mappings is not None
+        assert self._gathered_kv_slot_mappings is not None
+        assert self._global_batch is not None
+        assert self._padded_gather_idx is not None
+
+        global_batch = self._global_batch
+        global_slot_mappings = self._block_tables.compute_slot_mappings(
+            global_batch.idx_mapping,
+            global_batch.query_start_loc,
+            global_batch.positions,
+            global_batch.num_tokens,
+            out=self._global_batch_slot_mappings,
+        )
+        local_padded = input_batch.num_tokens_after_padding
+        rank_start = self.pcp_rank * local_padded
+        local_gather_idx = self._padded_gather_idx[
+            rank_start : rank_start + local_padded
+        ]
+        local_slot_mappings = self._gathered_kv_slot_mappings[:, :local_padded]
+        torch.index_select(
+            global_slot_mappings,
+            1,
+            local_gather_idx,
+            out=local_slot_mappings,
+        )
+        local_slot_mappings[:, input_batch.num_tokens :].fill_(PAD_SLOT_ID)
+        return local_slot_mappings
 
     def prepare_slot_mappings(self) -> torch.Tensor:
         assert self._block_tables is not None
@@ -619,7 +753,12 @@ class PCPManager:
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
         assert self._gathered_kv_slot_mappings is not None
         self._gathered_kv_slot_mappings.fill_(PAD_SLOT_ID)
-        return self._gathered_kv_slot_mappings[:, : num_tokens * self.pcp_world_size]
+        n = (
+            num_tokens
+            if current_platform.is_rocm()
+            else num_tokens * self.pcp_world_size
+        )
+        return self._gathered_kv_slot_mappings[:, :n]
 
     def _convert_to_gathered_slot_mappings(
         self,
@@ -653,7 +792,8 @@ class PCPManager:
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._hidden_restore_idx is None:
             return hidden_states
-        gathered = get_pcp_group().all_gather(hidden_states, dim=0)
+        with pcp_comm_trace("sampling:hidden_states"):
+            gathered = get_pcp_group().all_gather(hidden_states, dim=0)
         return gathered[self._hidden_restore_idx]
 
     def restore_for_sampling(

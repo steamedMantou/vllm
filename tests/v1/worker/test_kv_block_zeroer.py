@@ -56,7 +56,7 @@ def test_attention_blocks_are_zeroed(spec):
         },
     )
 
-    zeroer.zero_block_ids([1])
+    zeroer.zero_block_ids([[1]])
     torch.accelerator.synchronize()
 
     expected = torch.ones_like(storage)
@@ -83,6 +83,7 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
         page_size_el,  # blk_size
         1,  # n_segs
     )
+    zeroer._group_spans = [(0, 1, 1)]
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
@@ -90,8 +91,8 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
         # second call. Each call must stage from its own pinned source so the
         # first copy is not corrupted before it runs.
         torch.cuda._sleep(10_000_000)
-        zeroer.zero_block_ids([1])
-        zeroer.zero_block_ids([2])
+        zeroer.zero_block_ids([[1]])
+        zeroer.zero_block_ids([[2]])
     stream.synchronize()
 
     assert torch.all(storage[0] == 1)
@@ -131,10 +132,11 @@ def test_non_uniform_page_sizes():
         blk_size,
         2,
     )
+    zeroer._group_spans = [(0, 2, (max_ps + blk_size - 1) // blk_size)]
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        zeroer.zero_block_ids([1, 2])
+        zeroer.zero_block_ids([[1, 2]])
     stream.synchronize()
 
     for storage in (storage_a, storage_b):
@@ -170,13 +172,32 @@ def test_packed_segment_zeros_only_its_last_block_page():
         page_size_el,
         1,
     )
+    zeroer._group_spans = [(0, 1, 1)]
 
-    zeroer.zero_block_ids([num_blocks - 1])
+    zeroer.zero_block_ids([[num_blocks - 1]])
     torch.accelerator.synchronize()
 
     expected = torch.ones_like(backing)
     expected[-1, page_offset_el : page_offset_el + page_size_el] = 0
     assert torch.equal(backing, expected)
+
+
+def _fake_launches(monkeypatch) -> list:
+    """Record launch grids instead of running the kernel."""
+    grids: list = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            grids.append(grid)
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_kernel", FakeKernel())
+    monkeypatch.setattr(
+        worker_utils,
+        "async_tensor_h2d",
+        lambda values, **kwargs: torch.tensor(values, dtype=torch.int64),
+    )
+    return grids
 
 
 def test_large_dsv4_launch_geometry(monkeypatch):
@@ -198,11 +219,8 @@ def test_large_dsv4_launch_geometry(monkeypatch):
     }
     zeroer = KVBlockZeroer(
         device,
-        attn_groups_iter=[
-            AttentionGroup(None, [name], spec, group_id)
-            for group_id, name in enumerate(layer_names)
-        ],
-        kernel_block_sizes=[1] * n_segs,
+        attn_groups_iter=[AttentionGroup(None, layer_names, spec, 0)],
+        kernel_block_sizes=[1],
         static_forward_context={
             name: SimpleNamespace(kv_cache=storage)
             for name, storage in storages.items()
@@ -214,25 +232,96 @@ def test_large_dsv4_launch_geometry(monkeypatch):
     assert seg_page_sizes.tolist() == page_sizes
     assert (max_chunks, blk_size, n_segs) == (10, 1024, 181)
 
-    captured_grids = []
-
-    class FakeKernel:
-        def __getitem__(self, grid):
-            captured_grids.append(grid)
-            return lambda *args, **kwargs: None
-
-    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_kernel", FakeKernel())
-    monkeypatch.setattr(
-        worker_utils,
-        "async_tensor_h2d",
-        lambda values, **kwargs: torch.tensor(values, dtype=torch.int64),
-    )
-
-    zeroer.zero_block_ids(list(range(n_blocks)))
+    captured_grids = _fake_launches(monkeypatch)
+    zeroer.zero_block_ids([list(range(n_blocks))])
 
     old_max_chunks = max(page_sizes) // 4
     assert math.prod((n_blocks, n_segs, old_max_chunks)) > 2**31 - 1
     assert captured_grids == [(n_blocks, n_segs, max_chunks)]
+
+
+def test_groups_are_zeroed_independently(monkeypatch):
+    """A group's blocks must only reach that group's own segments.
+
+    Block IDs come from one pool but each is handed to a single group, so
+    clearing them against every group's segments would rewrite memory the
+    other groups still own. Hybrid models make that costly as well as wrong:
+    the narrow-block group allocates far more IDs per step than the wide one.
+    """
+    device = torch.device("cpu")
+    specs = [
+        SlidingWindowSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.int32,
+            sliding_window=1,
+        )
+        for _ in range(2)
+    ]
+    layers = {"wide.0": 9344, "wide.1": 9344, "narrow.0": 292}
+    storages = {
+        name: torch.ones((1, page), dtype=torch.int32)
+        for name, page in layers.items()
+    }
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[
+            AttentionGroup(None, ["wide.0", "wide.1"], specs[0], 0),
+            AttentionGroup(None, ["narrow.0"], specs[1], 1),
+        ],
+        kernel_block_sizes=[1, 1],
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=s) for name, s in storages.items()
+        },
+    )
+
+    assert zeroer._group_spans == [(0, 2, 10), (2, 1, 1)]
+
+    captured_grids = _fake_launches(monkeypatch)
+    zeroer.zero_block_ids([[3], [7, 8, 9]])
+
+    # Two segments and ten chunks for the wide group, one of each for the
+    # narrow one -- not three blocks against all three segments.
+    assert captured_grids == [(1, 2, 10), (3, 1, 1)]
+
+
+def test_overlaid_groups_share_a_segment(monkeypatch):
+    """Packed layers of different groups keep the segment in both groups.
+
+    Mixed-precision overlays are the reason zeroing exists, so whichever group
+    allocates the block has to clear the whole overlaid span, not just the
+    narrower view its own group sees.
+    """
+    device = torch.device("cpu")
+    spec = SlidingWindowSpec(
+        block_size=1, num_kv_heads=1, head_size=1, dtype=torch.int32, sliding_window=1
+    )
+    wide = torch.ones((2, 64), dtype=torch.int32)
+    narrow = wide[:, :32]
+    ctx = {
+        "packed.wide": SimpleNamespace(kv_cache=wide),
+        "packed.narrow": SimpleNamespace(kv_cache=narrow),
+    }
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[
+            AttentionGroup(None, ["packed.wide"], spec, 0),
+            AttentionGroup(None, ["packed.narrow"], spec, 1),
+        ],
+        kernel_block_sizes=[1, 1],
+        static_forward_context=ctx,
+    )
+
+    assert zeroer._group_spans == [(0, 1, 1), (1, 1, 1)]
+    seg_addrs, _, seg_page_sizes, _, _, _ = zeroer._meta
+    assert seg_addrs.tolist() == [wide.data_ptr()] * 2
+    # The narrow group's segment still spans the wide view.
+    assert seg_page_sizes.tolist() == [64, 64]
+
+    captured_grids = _fake_launches(monkeypatch)
+    zeroer.zero_block_ids([[0], []])
+    assert captured_grids == [(1, 1, 1)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -257,6 +346,7 @@ def test_warmup_compiles_for_all_block_counts():
         page_size_el,  # blk_size
         1,  # n_segs
     )
+    zeroer._group_spans = [(0, 1, 1)]
 
     def compiled_variants() -> set:
         return {
@@ -271,7 +361,7 @@ def test_warmup_compiles_for_all_block_counts():
     assert warmed
 
     for n_blocks in (1, 2, 3, 16, 32):
-        zeroer.zero_block_ids(list(range(n_blocks)))
+        zeroer.zero_block_ids([list(range(n_blocks))])
     torch.accelerator.synchronize()
 
     assert compiled_variants() == warmed
@@ -294,6 +384,7 @@ def test_warmup_respects_available_block_count():
         page_size_el,
         1,
     )
+    zeroer._group_spans = [(0, 1, 1)]
 
     zeroer.warmup(0)
     torch.accelerator.synchronize()
@@ -333,7 +424,7 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
         kernel_block_sizes=[spec.block_size],
         static_forward_context=ctx,
     )
-    zeroer.zero_block_ids([2])
+    zeroer.zero_block_ids([[2]])
     torch.accelerator.synchronize()
 
     for view in views:

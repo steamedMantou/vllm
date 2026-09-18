@@ -1118,7 +1118,10 @@ def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
 )
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 17])
 @pytest.mark.parametrize("kv_block_size", [16, 64])
-def test_fused_kv_insert_split(num_tokens: int, kv_block_size: int):
+@pytest.mark.parametrize("compact_boundaries", [False, True])
+def test_fused_kv_insert_split(
+    num_tokens: int, kv_block_size: int, compact_boundaries: bool
+):
     """Two-stage split compress+norm+rope+quant+insert for the head=512 KV cache."""
     HEAD_DIM = 512
     NOPE_DIM = 448
@@ -1189,6 +1192,11 @@ def test_fused_kv_insert_split(num_tokens: int, kv_block_size: int):
         ROPE_DIM,
         num_tokens,
         compress_scratch,
+        boundary_indices=(
+            torch.arange(num_tokens, dtype=torch.int64, device=device)
+            if compact_boundaries
+            else None
+        ),
     )
 
     # PyTorch reference: compress -> RMSNorm -> GPT-J RoPE (pre-quant bf16 row).
@@ -1230,3 +1238,177 @@ def test_fused_kv_insert_split(num_tokens: int, kv_block_size: int):
     # RoPE (last 64): stored as bf16. The kernel recomputes the rotation, so it
     # is bf16-close to the reference rather than bit-exact (cf. test_cutedsl).
     torch.testing.assert_close(recovered[:, NOPE_DIM:], ref[:, NOPE_DIM:])
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="two-stage split compressor is only enabled for ROCm at the moment",
+)
+def test_fused_kv_insert_split_compact_boundaries_match_dense():
+    """Compacting sparse C128 boundary rows must preserve every cache byte."""
+    head_dim, rope_dim = 512, 64
+    num_tokens, state_block_size, kv_block_size = 257, 8, 64
+    device = "cuda"
+    torch.manual_seed(43)
+
+    state_pages = (num_tokens + state_block_size - 1) // state_block_size
+    state_cache = torch.randn(
+        state_pages,
+        state_block_size,
+        2 * head_dim,
+        dtype=torch.float32,
+        device=device,
+    )
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    block_table = torch.arange(
+        state_pages, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    cos_sin_cache = torch.randn(
+        num_tokens, rope_dim, dtype=torch.float32, device=device
+    )
+    rms_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    kv_shape = (
+        (num_tokens + kv_block_size - 1) // kv_block_size,
+        kv_block_size,
+        584,
+    )
+    dense_cache = torch.zeros(kv_shape, dtype=torch.uint8, device=device)
+    compact_cache = torch.zeros_like(dense_cache)
+    dense_scratch = torch.empty(
+        num_tokens, head_dim, dtype=torch.float32, device=device
+    )
+    compact_scratch = torch.empty_like(dense_scratch)
+    kwargs = dict(
+        state_cache=state_cache,
+        token_to_req_indices=token_to_req,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        block_size=state_block_size,
+        state_width=head_dim,
+        compress_ratio=128,
+        cos_sin_cache=cos_sin_cache,
+        kv_slot_mapping=slot_mapping,
+        rms_norm_weight=rms_weight,
+        rms_norm_eps=1e-6,
+        quant_block=64,
+        token_stride=576,
+        scale_dim=8,
+        head_dim=head_dim,
+        rope_head_dim=rope_dim,
+        num_actual=num_tokens,
+    )
+    _launch_two_stage_sparse_attn_compressor(
+        **kwargs,
+        kv_cache=dense_cache,
+        compress_scratch=dense_scratch,
+    )
+    boundary_indices = torch.nonzero(
+        (positions + 1) % 128 == 0, as_tuple=False
+    ).flatten()
+    _launch_two_stage_sparse_attn_compressor(
+        **kwargs,
+        kv_cache=compact_cache,
+        compress_scratch=compact_scratch,
+        boundary_indices=boundary_indices,
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(compact_cache, dense_cache, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="two-stage split compressor is only enabled for ROCm at the moment",
+)
+def test_fused_kv_insert_split_compact_boundaries_match_pcp_zigzag_padding():
+    """A rank-major PCP zigzag layout must not change compact C128 cache bytes."""
+    head_dim, rope_dim = 512, 64
+    state_block_size, kv_block_size = 8, 64
+    # Rank 0: positions [500, 629] then [0, 129]; rank 1: [300, 429]
+    # followed by padding. This is the non-monotonic order that PCP gathers.
+    positions = torch.cat(
+        (
+            torch.arange(500, 630, dtype=torch.int64),
+            torch.arange(0, 130, dtype=torch.int64),
+            torch.arange(300, 430, dtype=torch.int64),
+            torch.zeros(130, dtype=torch.int64),
+        )
+    ).to("cuda")
+    num_tokens, valid_tokens = positions.numel(), 390
+    device = positions.device
+    torch.manual_seed(44)
+
+    state_pages = (630 + state_block_size - 1) // state_block_size
+    state_cache = torch.randn(
+        state_pages,
+        state_block_size,
+        2 * head_dim,
+        dtype=torch.float32,
+        device=device,
+    )
+    token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    slot_mapping[valid_tokens:] = -1
+    block_table = torch.arange(
+        state_pages, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+    cos_sin_cache = torch.randn(630, rope_dim, dtype=torch.float32, device=device)
+    rms_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    kv_shape = (
+        (valid_tokens + kv_block_size - 1) // kv_block_size,
+        kv_block_size,
+        584,
+    )
+    dense_cache = torch.zeros(kv_shape, dtype=torch.uint8, device=device)
+    compact_cache = torch.zeros_like(dense_cache)
+    kwargs = dict(
+        state_cache=state_cache,
+        token_to_req_indices=token_to_req,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        block_size=state_block_size,
+        state_width=head_dim,
+        compress_ratio=128,
+        cos_sin_cache=cos_sin_cache,
+        kv_slot_mapping=slot_mapping,
+        rms_norm_weight=rms_weight,
+        rms_norm_eps=1e-6,
+        quant_block=64,
+        token_stride=576,
+        scale_dim=8,
+        head_dim=head_dim,
+        rope_head_dim=rope_dim,
+        num_actual=num_tokens,
+    )
+    _launch_two_stage_sparse_attn_compressor(
+        **kwargs,
+        kv_cache=dense_cache,
+        compress_scratch=torch.empty(
+            num_tokens, head_dim, dtype=torch.float32, device=device
+        ),
+    )
+    boundary_indices = torch.nonzero(
+        (slot_mapping >= 0) & ((positions + 1) % 128 == 0),
+        as_tuple=False,
+    ).flatten()
+    torch.testing.assert_close(
+        boundary_indices,
+        torch.tensor([11, 257, 343], dtype=torch.int64, device=device),
+        rtol=0,
+        atol=0,
+    )
+    _launch_two_stage_sparse_attn_compressor(
+        **kwargs,
+        kv_cache=compact_cache,
+        compress_scratch=torch.empty(
+            num_tokens, head_dim, dtype=torch.float32, device=device
+        ),
+        boundary_indices=boundary_indices,
+    )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(compact_cache, dense_cache, rtol=0, atol=0)

@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -32,6 +33,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import cache
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import patch
@@ -1445,6 +1447,48 @@ _PCP: GroupCoordinator | None = None
 def get_pcp_group() -> GroupCoordinator:
     assert _PCP is not None, "prefill context parallel group is not initialized"
     return _PCP
+
+
+@cache
+def pcp_comm_ablation_enabled() -> bool:
+    """Price the PCP collectives by dropping them (VLLM_PCP_COMM_OFF=1).
+
+    Diagnostic only: PCP runs its collectives on the compute stream, so they
+    are fully exposed on the critical path and their cost cannot be read off a
+    profiler without the profiler's own per-dispatch overhead contaminating it.
+    With this set, each all-gather is replaced by a local repeat of the same
+    shape and the MoE all-reduce is skipped, so every non-collective kernel and
+    every tensor shape is preserved and the TTFT delta prices the collectives.
+    Results are numerically meaningless.
+    """
+    enabled = os.getenv("VLLM_PCP_COMM_OFF", "0") == "1"
+    if enabled:
+        logger.warning(
+            "VLLM_PCP_COMM_OFF=1: collectives are being dropped to measure "
+            "their cost. Model output is garbage; unset this to serve."
+        )
+    return enabled
+
+
+@cache
+def pcp_meta_gather_ablation_enabled() -> bool:
+    """Price dropping only the metadata gathers (VLLM_PCP_META_GATHER_OFF=1).
+
+    Diagnostic only. Each PCP cache gather sends its payload plus the
+    positions / slot mapping / token-to-request map that describe it, and those
+    describe the chunk rather than the layer, so all 61 layers gather the same
+    ones. They are also derivable locally from the global batch every rank
+    already holds. Dropping just them, with the payload gathers and the MoE
+    all-reduce left alone, prices that fix before it is built.
+    """
+    enabled = os.getenv("VLLM_PCP_META_GATHER_OFF", "0") == "1"
+    if enabled:
+        logger.warning(
+            "VLLM_PCP_META_GATHER_OFF=1: PCP metadata gathers are being "
+            "dropped to measure their cost. Model output is garbage; unset "
+            "this to serve."
+        )
+    return enabled
 
 
 @contextmanager

@@ -21,6 +21,7 @@ This file only keeps the MoE-shaped integration angle for those helpers.
 import importlib
 import math
 import warnings
+from contextlib import contextmanager
 from typing import Any, NamedTuple
 
 import pytest
@@ -253,6 +254,66 @@ def _make_topk_ids(
     router_logits = torch.randn(num_tokens, num_experts, device=device)
     _, topk_ids = torch.topk(torch.softmax(router_logits, dim=-1), k=topk, dim=-1)
     return topk_ids.to(torch.int32)
+
+
+class _FakePCPAllGather:
+    """Small rank-major all-gather stand-in for MoE communication tests."""
+
+    world_size = 2
+    device_group = object()
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def all_gather(self, value: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        assert dim == 0
+        self.calls += 1
+        return torch.cat((value, value + 100), dim=0)
+
+
+def test_pcp_moe_coalesced_allgather_preserves_contiguous_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batching two all-gathers must not change their rank-major layouts."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    pcp = _FakePCPAllGather()
+    first = torch.arange(12, dtype=torch.uint8).view(3, 4)
+    second = torch.arange(6, dtype=torch.uint8).view(3, 2)
+    monkeypatch.setattr(
+        moe_runner.envs, "VLLM_DSV4_MOE_COALESCED_ALLGATHER", True
+    )
+    monkeypatch.setattr(moe_runner, "pcp_comm_ablation_enabled", lambda: False)
+    seen: list[tuple[str, tuple]] = []
+
+    @contextmanager
+    def fake_coalescing_manager(*args, **kwargs):
+        seen.append(("manager", args))
+        assert kwargs["group"] is pcp.device_group
+        assert kwargs["device"] == first.device
+        yield
+
+    def fake_all_gather_into_tensor(output, value, *, group):
+        seen.append(("all_gather", (tuple(value.shape), group)))
+        assert group is pcp.device_group
+        output.copy_(torch.cat((value, value + 100), dim=0))
+
+    monkeypatch.setattr(
+        torch.distributed, "_coalescing_manager", fake_coalescing_manager
+    )
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", fake_all_gather_into_tensor
+    )
+
+    got_first, got_second = moe_runner.MoERunner._pcp_all_gather_pair(
+        pcp, first, second
+    )
+
+    assert pcp.calls == 0
+    assert got_first.is_contiguous() and got_second.is_contiguous()
+    torch.testing.assert_close(got_first, torch.cat((first, first + 100)))
+    torch.testing.assert_close(got_second, torch.cat((second, second + 100)))
+    assert [kind for kind, _ in seen] == ["manager", "all_gather", "all_gather"]
 
 
 def _shuffle_moe_weights(

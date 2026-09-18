@@ -377,8 +377,19 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_query_tokens,
                 attn_metadata=None,
                 slot_mappings=None,
+                # dp_sync was taken over the *target* forward, whose token count
+                # is the profiling batch (max_num_batched_tokens). This draft
+                # forward runs num_query_tokens instead, and DPMetadata.make
+                # asserts the two agree, so handing the target's counts straight
+                # through aborts memory profiling under DP>1 with e.g.
+                # "AssertionError: 8192 2560". Report what this forward will
+                # actually run; every rank does the same dummy step with the
+                # same num_reqs and num_query_per_req, so they all pad alike
+                # (same reasoning as the padding rewrite in gpu/dp_utils.py).
                 num_tokens_across_dp=(
-                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
+                    torch.full_like(dp_sync.num_tokens_across_dp, num_query_tokens)
+                    if dp_sync is not None
+                    else None
                 ),
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )

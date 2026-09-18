@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -30,6 +32,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
+from vllm.v1.attention.ops import dsv4_decode
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
@@ -39,6 +42,12 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+# Run sparse prefill on aiter's assembly kernel, reading the paged fp8 cache in
+# place instead of dequantizing it into a dense bf16 window first. Much faster
+# at the head counts PCP leaves on a rank, but both its GEMMs are fp8, so the
+# attention error is about ten times the Triton path's. Off by default.
+_USE_ASM_PREFILL = envs.VLLM_DSV4_PREFILL_ASM
 
 
 def _trust_dsv4_extra_cache_nan_free(
@@ -89,6 +98,79 @@ def apply_pre_quantized_block_scaled_mm(
         A=x_fp8, B=params.weight, As=x_scale, Bs=weight_scale
     )
     return out.to(dtype=kernel.config.out_dtype)
+
+
+_DSV4_INDEXER_WQB_CK_FALLBACK_M = frozenset(
+    (2, *range(65, 113), *range(129, 145))
+)
+
+_DSV4_WQB_CK_FALLBACK_M_BY_WEIGHT_SHAPE = {
+    # The full attention projection's generic Triton rows corrupt these
+    # small decode batches.
+    (65536, 1536): frozenset({1, 2, 4, 8}),
+    # The C4 indexer's generic Triton rows at M=2/80/96/112/144 misread the
+    # preshuffled block-scale layout. Runtime padding makes the unsafe bands
+    # M=2, 65..112, and 129..144. Keep tuned CKTILE at large M and use CK only
+    # for these known-bad inputs.
+    (8192, 1536): _DSV4_INDEXER_WQB_CK_FALLBACK_M,
+}
+
+
+def _needs_dsv4_wqb_ck_fallback(
+    linear: torch.nn.Module, x_fp8: torch.Tensor
+) -> bool:
+    """Avoid incorrect or unsupported DSV4 B-preshuffle CKTILE rows."""
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        return False
+    weight_shape = tuple(weight.shape)
+    m = x_fp8.shape[0]
+    if m in _DSV4_WQB_CK_FALLBACK_M_BY_WEIGHT_SHAPE.get(
+        weight_shape, ()
+    ):
+        return True
+    # profile_run exercises max_num_batched_tokens on every rank before PCP
+    # partitions the real request. At M=25600, the main WQB's bf16 output is
+    # 3.125 GiB; CKTILE's ABQuantGrouped fallback cannot address that tensor.
+    # PCP's real per-rank M is only 3200. CK accepts the same preshuffled scale
+    # layout, so this profile-only shape stays numerically identical.
+    return weight_shape == (65536, 1536) and m > 16384 and m % 4096 != 0
+
+
+def apply_bpreshuffle_block_scaled_mm(
+    linear: torch.nn.Module,
+    x_fp8: torch.Tensor,
+    x_scale_t: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Block-scaled fp8 GEMM against a weight preshuffled at load.
+
+    Same contract as ``apply_pre_quantized_block_scaled_mm`` -- column /
+    replicated linears only, so the sharded output needs no all-reduce.
+    ``x_scale_t`` must be the [K // 128, M] layout this entry point takes,
+    which is the opposite of what the non-preshuffled one wants.
+    """
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    out_dtype = linear.quant_method.fp8_linear.config.out_dtype
+    if _needs_dsv4_wqb_ck_fallback(linear, x_fp8):
+        # Generic AITER rows are incorrect for a few DSV4 shapes, and CKTILE
+        # cannot launch the non-4096-aligned profile shape. CK's default
+        # selector uses the same [K/128, M] scale and is bitwise equal to the
+        # plain WQB path.
+        from aiter import gemm_a8w8_blockscale_bpreshuffle_ck
+
+        output = torch.empty(
+            (x_fp8.shape[0], linear.weight.shape[0]),
+            dtype=out_dtype,
+            device=x_fp8.device,
+        )
+        return gemm_a8w8_blockscale_bpreshuffle_ck(
+            x_fp8, linear.weight, x_scale_t, weight_scale, output, kernelName=""
+        )
+    return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+        x_fp8, linear.weight, x_scale_t, weight_scale, output_dtype=out_dtype
+    )
 
 
 # ROCm sparse prefill keeps this dense combine local so AMD-specific SWA changes
@@ -520,6 +602,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+        self._wq_b_scale: torch.Tensor | None = None
         self._fused_compressor_weight: torch.Tensor | None
         self.register_buffer("_fused_compressor_weight", None, persistent=False)
         self._fused_compressor_split_sizes: tuple[int, int] | None = None
@@ -538,16 +621,20 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         )
         from vllm.model_executor.utils import replace_parameter
 
-        def _prep(linear) -> torch.Tensor | None:
+        def _eligible(linear) -> bool:
             w = getattr(linear, "weight", None)
             if w is None or w.dim() != 2:
-                return None
+                return False
             # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
             if w.shape[-1] % 128 != 0 or w.shape[0] % 16 != 0:
+                return False
+            return getattr(linear, "weight_scale_inv", None) is not None
+
+        def _prep(linear) -> torch.Tensor | None:
+            if not _eligible(linear):
                 return None
-            ws = getattr(linear, "weight_scale_inv", None)  # per-block scale
-            if ws is None:
-                return None
+            w = linear.weight
+            ws = linear.weight_scale_inv  # per-block scale
             if ws.dtype == torch.float8_e8m0fnu:
                 ws = _upcast_e8m0_to_fp32(ws).contiguous()
             # Shuffle the weight in place (single weight, no unshuffled copy).
@@ -560,6 +647,20 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
         self._wo_b_scale = _prep(self.wo_b)
+        # The full attention wq_b [65536, 1536] is bitwise equal to the
+        # unshuffled path. The C4 indexer [8192, 1536] keeps a separate
+        # opt-in because its generic padded small-M configurations are
+        # incorrect; apply_bpreshuffle_block_scaled_mm routes those bands to CK.
+        if envs.VLLM_DSV4_WQ_B_PRESHUFFLE and _eligible(self.wq_b):
+            self._wq_b_scale = _prep(self.wq_b)
+        if self.indexer is not None:
+            self.indexer._wq_b_input_scale_transposed = self._wq_b_scale is not None
+            if (
+                self._wq_b_scale is not None
+                and envs.VLLM_DSV4_INDEXER_WQ_B_PRESHUFFLE
+                and _eligible(self.indexer.wq_b)
+            ):
+                self.indexer._wq_b_scale = _prep(self.indexer.wq_b)
 
     def prepare_compressor_gemm_fusion(self) -> bool:
         if self._fused_compressor_weight is not None:
@@ -706,7 +807,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         from vllm._aiter_ops import rocm_aiter_ops
 
-        return rocm_aiter_ops.fused_qk_rmsnorm_group_quant(
+        qr_fp8, qr_scale, kv_out = rocm_aiter_ops.fused_qk_rmsnorm_group_quant(
             q=qr,
             q_weight=self.q_norm.weight.data,
             q_epsilon=self.eps,
@@ -716,6 +817,21 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             group_size=128,
             transpose_scale=False,
         )
+        if self._wq_b_scale is not None:
+            # The preshuffled GEMM reads the scale as [K // 128, M] while this
+            # kernel writes [M, K // 128]. Transpose it once; a regular
+            # indexer wq_b converts it back before its own GEMM.
+            qr_scale = qr_scale.t().contiguous()
+        return qr_fp8, qr_scale, kv_out
+
+    def _wq_b_proj(
+        self, qr: torch.Tensor, qr_scale: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if qr_scale is not None and self._wq_b_scale is not None:
+            return apply_bpreshuffle_block_scaled_mm(
+                self.wq_b, qr, qr_scale, self._wq_b_scale
+            )
+        return super()._wq_b_proj(qr, qr_scale)
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
@@ -855,6 +971,37 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
+        # Attention straight off the pool, in the same shape the Triton path
+        # below would take.  Declining is safe at any point: nothing has been
+        # mutated, and the decision is made before capture, so whichever path
+        # runs is the one the CUDA graph records.
+        if dsv4_decode.try_dsv4_decode(
+            q=q,
+            output=output,
+            compressed_k_cache=kv_cache,
+            swa_k_cache=self.swa_cache_layer.kv_cache,
+            compressed_ragged_indices=topk_ragged_indices,
+            compressed_ragged_indptr=topk_ragged_indptr,
+            swa_ragged_indices=swa_metadata.decode_swa_ragged_indices,
+            swa_ragged_indptr=swa_metadata.decode_swa_ragged_indptr,
+            compressed_page_size=(
+                None
+                if attn_metadata is None
+                else attn_metadata.block_size // self.compress_ratio
+            ),
+            swa_page_size=swa_metadata.block_size,
+            # This step's actual rows per request, so the adapter can keep a
+            # request's rows on one XCD while dealing requests across them.
+            num_decodes=num_decodes,
+            kv_cache_dtype=self.kv_cache_dtype,
+            attn_sink=self.attn_sink,
+            softmax_scale=self.scale,
+            head_dim=self.head_dim,
+            nope_head_dim=self.nope_head_dim,
+            rope_head_dim=self.rope_head_dim,
+        ):
+            return
+
         rocm_sparse_attn_decode(
             q=q,
             kv_cache=kv_cache,
@@ -940,6 +1087,27 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+
+            if _USE_ASM_PREFILL:
+                self._forward_prefill_asm(
+                    q=q,
+                    compressed_k_cache=compressed_k_cache,
+                    swa_k_cache=swa_k_cache,
+                    output=output,
+                    attn_metadata=attn_metadata,
+                    swa_metadata=swa_metadata,
+                    topk_indices=topk_indices,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    prefill_token_base=prefill_token_base,
+                    num_decodes=num_decodes,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    swa_only=swa_only,
+                )
+                continue
+
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
@@ -1000,3 +1168,76 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
             )
+
+    def _forward_prefill_asm(
+        self,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        topk_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        prefill_token_base: int,
+        num_decodes: int,
+        chunk_start: int,
+        chunk_end: int,
+        swa_only: bool,
+    ) -> None:
+        """One prefill chunk, straight off the paged cache. See asm_sparse_prefill."""
+        from vllm.models.deepseek_v4.amd.asm_sparse_prefill import (
+            asm_sparse_attn_prefill,
+            build_swa_ragged_indices,
+            token_positions,
+        )
+
+        query_start = query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+        query_end = query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+        num_tokens = int(query_end - query_start)
+        chunk_qsl = query_start_loc[
+            num_decodes + chunk_start : num_decodes + chunk_end + 1
+        ]
+        chunk_seq_lens = seq_lens[chunk_start:chunk_end]
+        positions, token_to_req = token_positions(chunk_qsl, chunk_seq_lens, num_tokens)
+
+        prefix_indices = prefix_indptr = None
+        compressed_block_size = 0
+        if not swa_only:
+            assert attn_metadata is not None
+            assert compressed_k_cache is not None
+            compressed_block_size = attn_metadata.block_size // self.compress_ratio
+            prefix_indices, prefix_indptr, _ = (
+                compute_global_topk_ragged_indices_and_indptr(
+                    topk_indices[query_start:query_end],
+                    token_to_req,
+                    attn_metadata.block_table[num_decodes:][chunk_start:chunk_end],
+                    compressed_block_size,
+                    torch.ones(num_tokens, dtype=torch.bool, device=q.device),
+                )
+            )
+
+        extend_indices, extend_indptr = build_swa_ragged_indices(
+            positions,
+            token_to_req,
+            swa_metadata.block_table[num_decodes:][chunk_start:chunk_end],
+            swa_metadata.block_size,
+            self.window_size,
+        )
+
+        asm_sparse_attn_prefill(
+            q=q[query_start:query_end],
+            compressed_k_cache=compressed_k_cache,
+            swa_k_cache=swa_k_cache,
+            prefix_indices=prefix_indices,
+            prefix_indptr=prefix_indptr,
+            extend_indices=extend_indices,
+            extend_indptr=extend_indptr,
+            compressed_block_size=compressed_block_size,
+            swa_block_size=swa_metadata.block_size,
+            attn_sink=self.attn_sink,
+            scale=self.scale,
+            output=output[query_start:query_end],
+        )

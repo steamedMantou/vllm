@@ -347,6 +347,83 @@ def test_paged_mqa_logits_do_not_contain_nan(monkeypatch) -> None:
 
 
 @torch.inference_mode()
+def test_fp8_mqa_logits_preshuffle_env_dispatch(monkeypatch) -> None:
+    """The dense HIP path preserves AITER's clean-logits contract."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(mod, "_ON_GFX950", True)
+    monkeypatch.setattr(mod.envs, "VLLM_DSV4_MQA_LOGITS_IMPL", "preshuffle")
+    seen: dict[str, torch.Tensor] = {}
+
+    def fake_dense_mqa(q, k, scale, weights, starts, ends, *, out):
+        seen.update(
+            q=q, k=k, scale=scale, weights=weights, starts=starts, ends=ends
+        )
+        out[:, :2].fill_(3.0)
+        return out
+
+    monkeypatch.setattr(mod, "_preshuffle_mqa_logits", lambda: fake_dense_mqa)
+    q = torch.empty((2, 64, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.empty((4, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    scale = torch.ones((4, 1), device="cuda", dtype=torch.float32)
+    weights = torch.ones((2, 64), device="cuda", dtype=torch.float32)
+    starts = torch.zeros(2, device="cuda", dtype=torch.int32)
+    ends = torch.full((2,), 2, device="cuda", dtype=torch.int32)
+
+    logits = mod.rocm_fp8_mqa_logits(
+        q, (k, scale), weights, starts, ends, clean_logits=True
+    )
+
+    assert seen["q"] is q
+    assert seen["k"] is k
+    assert seen["scale"] is scale
+    assert torch.equal(logits[:, :2], torch.full_like(logits[:, :2], 3.0))
+    assert torch.isneginf(logits[:, 2:]).all()
+
+
+@torch.inference_mode()
+def test_fp8_mqa_logits_gluon_env_dispatch(monkeypatch) -> None:
+    """The default mode must not import or invoke dense_mqa."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    monkeypatch.setattr(mod.envs, "VLLM_DSV4_MQA_LOGITS_IMPL", "gluon")
+    monkeypatch.setattr(mod, "_ON_GFX942", False)
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+
+    expected = torch.empty((1, 1), device="cuda", dtype=torch.float32)
+    called = False
+
+    def fake_gluon(*args, **kwargs):
+        nonlocal called
+        called = True
+        assert kwargs["clean_logits"] is False
+        return expected
+
+    def fail_dense_import():
+        raise AssertionError("gluon mode must not import dense_mqa")
+
+    monkeypatch.setattr(
+        mod, "mqa_logits_module", lambda: SimpleNamespace(fp8_mqa_logits=fake_gluon)
+    )
+    monkeypatch.setattr(mod, "_preshuffle_mqa_logits", fail_dense_import)
+    result = mod.rocm_fp8_mqa_logits(
+        torch.empty((1, 1, 1), device="cuda", dtype=torch.float8_e4m3fn),
+        (
+            torch.empty((1, 1), device="cuda", dtype=torch.float8_e4m3fn),
+            torch.ones(1, device="cuda"),
+        ),
+        torch.ones((1, 1), device="cuda"),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        torch.ones(1, device="cuda", dtype=torch.int32),
+        clean_logits=False,
+    )
+
+    assert called
+    assert result is expected
+
+
+@torch.inference_mode()
 def test_compute_global_topk_ragged_indices_and_indptr() -> None:
     from vllm.models.deepseek_v4.amd.rocm import (
         compute_global_topk_ragged_indices_and_indptr,
@@ -412,9 +489,9 @@ def test_extra_cache_nan_free_provenance_gate(monkeypatch) -> None:
 
 
 @torch.inference_mode()
-def test_sparse_attn_prefill_ragged_kernel() -> None:
+def test_sparse_attn_prefill_aiter_ragged() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-        _rocm_sparse_attn_prefill_ragged_triton,
+        rocm_sparse_attn_prefill,
     )
 
     device = torch.device("cuda")
@@ -426,15 +503,20 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
     attn_sink = torch.tensor([-0.25, 0.0, 0.25], dtype=torch.float32, device=device)
     scale = HEAD_DIM**-0.5
 
-    actual = _rocm_sparse_attn_prefill_ragged_triton(
+    actual = torch.empty_like(q)
+    rocm_sparse_attn_prefill(
         q=q,
-        kv=kv,
+        kv=kv.unsqueeze(1),
         indices=indices,
-        indptr=indptr,
+        topk_length=None,
         scale=scale,
-        attn_sink=attn_sink,
+        head_dim=HEAD_DIM,
         nope_head_dim=NOPE_HEAD_DIM,
         rope_head_dim=ROPE_HEAD_DIM,
+        attn_sink=attn_sink,
+        output=actual,
+        ragged_indices=indices,
+        ragged_indptr=indptr,
     )
     expected = _ref_sparse_prefill_ragged(
         q, kv, [[0, 2], [1, 3, 4], []], scale, attn_sink
@@ -1054,6 +1136,59 @@ def test_fused_inverse_rope_gptj_empty(default_vllm_config) -> None:
     assert out.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("num_tokens", [1, 7, 64])
+# 1 and 9 heads straddle the kernel's 8-head tile, so both the exact and the
+# masked-remainder launch get covered.
+@pytest.mark.parametrize("num_heads", [1, 8, 9])
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_fused_inverse_rope_gptj_inplace_matches_rotary_native(
+    num_tokens: int, num_heads: int, pos_dtype: torch.dtype, default_vllm_config
+) -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fused_inverse_rope_gptj_inplace,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    rotary_emb = _make_dsv4_rotary(device)
+    o = torch.randn(
+        num_tokens, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    positions = torch.randint(
+        0, _ROTARY_CACHE_LEN, (num_tokens,), dtype=pos_dtype, device=device
+    )
+    expected = _inv_rope_via_rotary_native(rotary_emb, o, positions)
+
+    returned = _fused_inverse_rope_gptj_inplace(
+        o, positions, rotary_emb.cos_sin_cache, ROPE_HEAD_DIM
+    )
+
+    assert returned.data_ptr() == o.data_ptr()
+    # The NoPE lanes are never written, so they stay bit-identical rather than
+    # merely close.
+    assert torch.equal(o[..., :NOPE_HEAD_DIM], expected[..., :NOPE_HEAD_DIM])
+    # RoPE lanes: tolerate at most ~1 bf16 ulp from fp32 fma ordering.
+    torch.testing.assert_close(o, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_fused_inverse_rope_gptj_inplace_empty(default_vllm_config) -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fused_inverse_rope_gptj_inplace,
+    )
+
+    device = torch.device("cuda")
+    rotary_emb = _make_dsv4_rotary(device)
+    o = torch.empty(0, 8, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.empty(0, dtype=torch.int32, device=device)
+
+    out = _fused_inverse_rope_gptj_inplace(
+        o, positions, rotary_emb.cos_sin_cache, ROPE_HEAD_DIM
+    )
+    assert out.shape == (0, 8, HEAD_DIM)
+
+
 @torch.inference_mode()
 def test_rocm_inv_rope_einsum_matches_rotary_native(default_vllm_config) -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
@@ -1080,17 +1215,24 @@ def test_rocm_inv_rope_einsum_matches_rotary_native(default_vllm_config) -> None
     ).to(torch.bfloat16)
     wo_a = _FakeWoA(weight)
 
+    # Snapshot the input: rocm_inv_rope_einsum consumes o.
+    o_input = o.clone()
+
     actual = rocm_inv_rope_einsum(
         rotary_emb, o, positions, ROPE_HEAD_DIM, n_local_groups, o_lora_rank, wo_a
     )
 
-    o_ref = _inv_rope_via_rotary_native(rotary_emb, o, positions)
-    o_ref = o_ref.view(num_tokens, n_local_groups, -1)
+    o_rotated = _inv_rope_via_rotary_native(rotary_emb, o_input, positions)
     wo_a_ref = weight.view(n_local_groups, o_lora_rank, hidden_dim).to(torch.bfloat16)
-    expected = torch.einsum("tgd,grd->tgr", o_ref, wo_a_ref)
+    expected = torch.einsum(
+        "tgd,grd->tgr", o_rotated.view(num_tokens, n_local_groups, -1), wo_a_ref
+    )
 
     assert actual.shape == (num_tokens, n_local_groups, o_lora_rank)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    # Part of the contract, not an accident: the rope lanes are rotated in
+    # place instead of into a second [T, H, D] buffer, so o comes back rotated.
+    torch.testing.assert_close(o, o_rotated, atol=2e-2, rtol=2e-2)
 
 
 @torch.inference_mode()
@@ -1161,3 +1303,123 @@ def test_get_cached_wo_a_bf16_fp8_blockscale_caches() -> None:
 
     # Second call returns the same cached object.
     assert _get_cached_wo_a_bf16(wo_a, n_local_groups, o_lora_rank, hidden_dim) is out
+
+
+@pytest.mark.parametrize("parent_scale_is_transposed", [False, True])
+def test_indexer_wq_b_restores_row_major_parent_scale(
+    monkeypatch, parent_scale_is_transposed: bool
+) -> None:
+    """An unshuffled indexer must undo the parent's main-WQB scale transpose."""
+    from vllm.models.deepseek_v4.amd import rocm
+    from vllm.models.deepseek_v4.attention import DeepseekV4Indexer
+
+    row_major_scale = torch.arange(96 * 12, dtype=torch.float32).view(96, 12)
+    input_scale = (
+        row_major_scale.t().contiguous()
+        if parent_scale_is_transposed
+        else row_major_scale
+    )
+    indexer = SimpleNamespace(
+        _wq_b_scale=None,
+        _wq_b_input_scale_transposed=parent_scale_is_transposed,
+        wq_b=object(),
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_apply(_linear, _qr, scale):
+        captured["scale"] = scale
+        return torch.empty(0)
+
+    monkeypatch.setattr(rocm, "apply_pre_quantized_block_scaled_mm", fake_apply)
+    DeepseekV4Indexer._wq_b_proj(indexer, torch.empty((96, 1536)), input_scale)
+
+    assert captured["scale"].is_contiguous()
+    torch.testing.assert_close(captured["scale"], row_major_scale, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("weight_shape", "m", "expected"),
+    [
+        ((65536, 1536), 1, True),
+        ((65536, 1536), 2, True),
+        ((65536, 1536), 4, True),
+        ((65536, 1536), 8, True),
+        ((65536, 1536), 3, False),
+        ((65536, 1536), 16, False),
+        ((65536, 1536), 16384, False),
+        ((65536, 1536), 16385, True),
+        ((65536, 1536), 20480, False),
+        ((65536, 1536), 25600, True),
+        ((8192, 1536), 1, False),
+        ((8192, 1536), 2, True),
+        ((8192, 1536), 4, False),
+        ((8192, 1536), 8, False),
+        ((8192, 1536), 64, False),
+        ((8192, 1536), 65, True),
+        ((8192, 1536), 80, True),
+        ((8192, 1536), 96, True),
+        ((8192, 1536), 112, True),
+        ((8192, 1536), 113, False),
+        ((8192, 1536), 128, False),
+        ((8192, 1536), 129, True),
+        ((8192, 1536), 144, True),
+        ((8192, 1536), 145, False),
+        ((8192, 1536), 2048, False),
+    ],
+)
+def test_dsv4_wq_b_ck_fallback_is_limited_to_bad_or_unsupported_shapes(
+    weight_shape: tuple[int, int], m: int, expected: bool
+) -> None:
+    from vllm.models.deepseek_v4.amd.rocm import _needs_dsv4_wqb_ck_fallback
+
+    linear = SimpleNamespace(weight=torch.empty(weight_shape))
+    assert _needs_dsv4_wqb_ck_fallback(linear, torch.empty((m, 1536))) is expected
+
+
+@requires_gfx950
+@torch.inference_mode()
+@pytest.mark.parametrize("m", [2, 65, 80, 81, 96, 97, 112, 129, 144])
+def test_dsv4_indexer_wq_b_ck_fallback_matches_regular_blockscale(m: int) -> None:
+    """Known-bad indexer preshuffle shapes must retain regular WQB numerics."""
+    from aiter import dtypes
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck
+    from aiter.ops.shuffle import shuffle_weight
+
+    from vllm.models.deepseek_v4.amd.rocm import (
+        apply_bpreshuffle_block_scaled_mm,
+    )
+
+    n, k = 8192, 1536
+    device = torch.device("cuda")
+    torch.manual_seed(24)
+    x = (torch.rand((m, k), device=device, dtype=torch.float32) / 10).to(
+        dtypes.fp8
+    )
+    weight = (torch.rand((n, k), device=device, dtype=torch.float32) / 10).to(
+        dtypes.fp8
+    )
+    x_scale = torch.rand((m, k // 128), device=device, dtype=torch.float32)
+    weight_scale = torch.rand(
+        (n // 128, k // 128), device=device, dtype=torch.float32
+    )
+
+    reference = torch.empty((m, n), dtype=dtypes.bf16, device=device)
+    gemm_a8w8_blockscale_ck(
+        x, weight, x_scale, weight_scale, reference, splitK=0
+    )
+    linear = SimpleNamespace(
+        weight=shuffle_weight(weight, layout=(16, 16)),
+        quant_method=SimpleNamespace(
+            fp8_linear=SimpleNamespace(
+                config=SimpleNamespace(out_dtype=torch.bfloat16)
+            )
+        ),
+    )
+    actual = apply_bpreshuffle_block_scaled_mm(
+        linear,
+        x,
+        x_scale.t().contiguous(),
+        weight_scale,
+    )
+
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)

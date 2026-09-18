@@ -17,6 +17,7 @@ from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -105,6 +106,18 @@ class KVBlockZeroer:
     Construct once after KV caches are allocated to precompute segment
     addresses, then call :meth:`zero_block_ids` each step to zero
     newly-allocated blocks.
+
+    Segments are kept per KV cache group. Block IDs come from one shared pool
+    but each ID is handed to exactly one group, and a group's ID only addresses
+    that group's own layers, so zeroing it against every group's segments would
+    rewrite unrelated memory. Hybrid models make that expensive: DSV4 runs five
+    groups whose block sizes span 4..256 tokens, so a step that allocates 96
+    blocks for the widest group allocates 6144 for the narrowest, and clearing
+    all 10080 against all 197 segments writes 44 GiB instead of ~1 GiB.
+
+    Layers of different groups that are overlaid at one address (packed KV) are
+    registered under each of those groups, so whichever group allocates the
+    block still clears the full overlaid span.
     """
 
     def __init__(
@@ -137,16 +150,20 @@ class KVBlockZeroer:
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
+        # (segment offset into the flat tables, count, chunks) per group id.
+        self._group_spans: list[tuple[int, int, int]] = []
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         # Overlaid layers (packed layouts) share a base address but may have
-        # different page sizes; keep the widest span per address so newly
-        # allocated blocks are fully zeroed for every overlaying group.
-        seen_ptrs: dict[int, int] = {}
-        seg_addrs: list[int] = []
-        seg_block_strides: list[int] = []
-        seg_page_sizes: list[int] = []
+        # different page sizes; the widest span wins so a newly allocated block
+        # is fully cleared for every layer overlaying it. The span is global to
+        # the address, while the segment itself is recorded once per group that
+        # reaches it, since only the group owning a block will clear it.
+        widest_page: dict[int, int] = {}
+        strides: dict[int, int] = {}
+        # Addresses form an ordered set per group; dict keeps insertion order.
+        per_group: dict[int, dict[int, None]] = defaultdict(dict)
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -157,6 +174,7 @@ class KVBlockZeroer:
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
             ratio = spec.block_size // kernel_bs
+            group_addrs = per_group[group.kv_cache_group_id]
 
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
@@ -187,62 +205,76 @@ class KVBlockZeroer:
                     assert (dp + off_bytes) % 4 == 0
                     for virtual_index in range(ratio):
                         addr = dp + off_bytes + virtual_index * block_stride_bytes
-                        if (idx := seen_ptrs.get(addr)) is not None:
-                            assert (
-                                seg_block_strides[idx]
-                                == logical_block_stride_bytes // 4
+                        if addr in widest_page:
+                            assert strides[addr] == logical_block_stride_bytes // 4
+                            widest_page[addr] = max(
+                                widest_page[addr], kernel_page_bytes // 4
                             )
-                            seg_page_sizes[idx] = max(
-                                seg_page_sizes[idx], kernel_page_bytes // 4
-                            )
-                            continue
-                        seen_ptrs[addr] = len(seg_addrs)
-                        seg_addrs.append(addr)
-                        seg_block_strides.append(logical_block_stride_bytes // 4)
-                        seg_page_sizes.append(kernel_page_bytes // 4)
+                        else:
+                            widest_page[addr] = kernel_page_bytes // 4
+                            strides[addr] = logical_block_stride_bytes // 4
+                        group_addrs[addr] = None
 
-        if not seg_addrs:
+        if not widest_page:
             self._meta = None
             return
 
-        max_page_size_el = max(seg_page_sizes)
-        blk_size = min(1 << (max_page_size_el - 1).bit_length(), 1024)
+        # Lay the groups out contiguously so each one can be launched from a
+        # slice of the shared tables instead of a table of its own.
+        seg_addrs: list[int] = []
+        seg_block_strides: list[int] = []
+        seg_page_sizes: list[int] = []
+        spans: dict[int, tuple[int, int, int]] = {}
+        blk_size = min(1 << (max(widest_page.values()) - 1).bit_length(), 1024)
+        for group_id in sorted(per_group):
+            addrs = list(per_group[group_id])
+            if not addrs:
+                continue
+            pages = [widest_page[addr] for addr in addrs]
+            spans[group_id] = (len(seg_addrs), len(addrs), cdiv(max(pages), blk_size))
+            seg_addrs += addrs
+            seg_block_strides += [strides[addr] for addr in addrs]
+            seg_page_sizes += pages
+
+        self._group_spans = [
+            spans.get(group_id, (0, 0, 0)) for group_id in range(max(spans) + 1)
+        ]
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
             torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
-            (max_page_size_el + blk_size - 1) // blk_size,
+            cdiv(max(seg_page_sizes), blk_size),
             blk_size,
             len(seg_addrs),
         )
 
-    def zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+    def zero_block_ids(self, block_ids_by_group: Sequence[Sequence[int]]) -> None:
+        """Zero the KV cache memory for each group's newly allocated blocks."""
+        if self._meta is None:
             return
-        (
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            max_chunks,
-            blk_size,
-            n_segs,
-        ) = self._meta
-        n_blocks = len(block_ids)
-        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
-        grid = (n_blocks, n_segs, max_chunks)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            idx,
-            BLOCK_SIZE=blk_size,
-        )
+        seg_addrs, seg_block_strides, seg_page_sizes, _, blk_size, _ = self._meta
+        for group_id, block_ids in enumerate(block_ids_by_group):
+            if not block_ids or group_id >= len(self._group_spans):
+                continue
+            start, n_segs, max_chunks = self._group_spans[group_id]
+            if not n_segs:
+                continue
+            idx = async_tensor_h2d(
+                list(block_ids), device=self.device, dtype=torch.int64
+            )
+            end = start + n_segs
+            _zero_kv_blocks_kernel[(len(block_ids), n_segs, max_chunks)](
+                seg_addrs[start:end],
+                seg_block_strides[start:end],
+                seg_page_sizes[start:end],
+                idx,
+                BLOCK_SIZE=blk_size,
+            )
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
         if num_kv_blocks > 0:
-            self.zero_block_ids([0])
+            self.zero_block_ids([[0]] * len(self._group_spans))
 
 
 @dataclass

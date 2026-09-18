@@ -1551,10 +1551,30 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         from aiter.ops.shuffle import shuffle_scale as _shuf_s
         from aiter.ops.shuffle import shuffle_weight as _shuf_w
 
+        # A8W4 runs the gate/up-interleaved (_gui_) kernels and wants the
+        # interleaved layout. A4W4 has no interleaved kernel to run -- every
+        # flydsl_moe1_afp4_* variant is separated-layout -- so the weights have
+        # to be laid out separated to match, and rocm_aiter_moe.py asks for
+        # GateMode.SEPARATED off this same env var. The two must agree: a
+        # separated kernel reading interleaved weights does not fail, it
+        # silently swaps half of gate with half of up.
+        #
+        # This is why VLLM_DSV4_MOE_A4W4 is a launch-time switch. The layout is
+        # decided here, once, while the checkpoint is being loaded.
+        #
+        # NOTE: unverified on hardware. w2 is the down projection and has no
+        # gate/up pairing to interleave, so is_guinterleave is selecting a
+        # swizzle variant for it rather than an interleave; it is carried along
+        # with w13 here on the reading that the flag names the layout the
+        # kernel reads, not the operand's own structure. If A4W4 comes out
+        # numerically wrong while A8W4 stays correct, pinning w2 back to True
+        # is the first thing to try.
+        guinterleave = not envs.VLLM_DSV4_MOE_A4W4
+
         w13_weight = torch.nn.Parameter(
             _shuf_w(
                 w13_weight.data.view(torch.float4_e2m1fn_x2),
-                is_guinterleave=True,
+                is_guinterleave=guinterleave,
                 gate_up=True,
             ),
             requires_grad=False,
@@ -1562,14 +1582,14 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         shuffled_w13_scale = _shuf_s(
             w13_weight_scale.reshape(-1, w13_weight_scale.shape[-1]),
             num_experts,
-            True,
+            guinterleave,
             True,
         )
 
         w2_weight = torch.nn.Parameter(
             _shuf_w(
                 w2_weight.data.view(torch.float4_e2m1fn_x2),
-                is_guinterleave=True,
+                is_guinterleave=guinterleave,
                 gate_up=False,
             ),
             requires_grad=False,
@@ -1578,7 +1598,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         shuffled_w2_scale = _shuf_s(
             w2_weight_scale.reshape(-1, w2_weight_scale.shape[-1]),
             num_experts,
-            True,
+            guinterleave,
             False,
         )
 

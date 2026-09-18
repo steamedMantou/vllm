@@ -33,9 +33,11 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.pcp import pcp_comm_trace
 from vllm.v1.kv_cache_interface import KVCacheLayout, KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -866,7 +868,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if self.compress_ratio > 1:
             padded_num_tokens = num_tokens
             if self.pcp_world_size > 1:
-                padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
+                # Generic MLA receives a rank-major gathered slot map, whereas
+                # ROCm DSV4 receives a rank-local map because its fused Q/KV
+                # insert requires one slot per local Q row.
+                padded_num_tokens = (
+                    slot_mapping.shape[0]
+                    if current_platform.is_rocm()
+                    else slot_mapping.shape[0] // self.pcp_world_size
+                )
+                self.compressed_slot_mapping_buffer[
+                    num_tokens:padded_num_tokens
+                ].fill_(PAD_SLOT_ID)
             compressed_slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
                 query_start_loc,
@@ -877,10 +889,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 out=self.compressed_slot_mapping_buffer,
             )
             if self.pcp_world_size > 1:
-                compressed_slot_mapping = get_pcp_group().all_gather(
-                    self.compressed_slot_mapping_buffer[:padded_num_tokens],
-                    dim=0,
-                )
+                if current_platform.is_rocm():
+                    with pcp_comm_trace("indexer_slot_mapping"):
+                        gathered_prefill_slots = get_pcp_group().all_gather(
+                            self.compressed_slot_mapping_buffer[
+                                num_decode_tokens:padded_num_tokens
+                            ],
+                            dim=0,
+                        )
+                    compressed_slot_mapping = torch.cat(
+                        (
+                            self.compressed_slot_mapping_buffer[:num_decode_tokens],
+                            gathered_prefill_slots,
+                        ),
+                        dim=0,
+                    )
+                else:
+                    with pcp_comm_trace("indexer_slot_mapping"):
+                        compressed_slot_mapping = get_pcp_group().all_gather(
+                            self.compressed_slot_mapping_buffer[:padded_num_tokens],
+                            dim=0,
+                        )
             compressed_seq_lens = seq_lens // self.compress_ratio
 
         prefill_metadata = None

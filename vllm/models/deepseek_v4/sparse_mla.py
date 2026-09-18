@@ -9,6 +9,8 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.distributed import get_pcp_group
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -22,6 +24,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.ops.pcp import pcp_comm_trace
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
@@ -30,6 +33,28 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 # Padded slots stay -1 and decode_lens caps them via topk_length, so the pad is a
 # no-op at kernel level. Mirrors _SPARSE_PREFILL_TOPK_ALIGNMENT in cache_utils.py.
 _C128A_TOPK_ALIGNMENT = 128
+
+
+def _gather_pcp_prefill_slot_mapping(
+    local_slot_mapping: torch.Tensor,
+    num_decode_tokens: int,
+) -> torch.Tensor:
+    """Match PCP cache-payload order: local decodes then rank-major prefills.
+
+    ROCm's fused Q/KV insertion requires the common slot map to stay local,
+    while the compressor gathers its prefill projections before inserting
+    compressed KV. Its target map must therefore be gathered separately in
+    exactly the same order. Other backends already receive a gathered map.
+    """
+    if num_decode_tokens == local_slot_mapping.shape[0]:
+        return local_slot_mapping
+    with pcp_comm_trace("c128_slot_mapping"):
+        gathered_prefills = get_pcp_group().all_gather(
+            local_slot_mapping[num_decode_tokens:].contiguous(), dim=0
+        )
+    if num_decode_tokens == 0:
+        return gathered_prefills
+    return torch.cat((local_slot_mapping[:num_decode_tokens], gathered_prefills), dim=0)
 
 
 class DeepseekV4SparseMLABackend(AttentionBackend):
@@ -66,6 +91,12 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
             "DeepseekV4SparseMLABackend has no separate impl class; DeepSeek-V4 "
             "attention runs through DeepseekV4Attention."
         )
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        # No separate impl class; PCP is applied by rewriting the rank-local
+        # batch in PCPManager before this layer sees tokens.
+        return True
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -126,6 +157,9 @@ class DeepseekV4SparseMLAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
+        self.pcp_world_size = (
+            vllm_config.parallel_config.prefill_context_parallel_size
+        )
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
@@ -195,6 +229,25 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
+            if (
+                self.pcp_world_size > 1
+                and current_platform.is_rocm()
+            ):
+                # ``cm.slot_mapping`` is rank-local on ROCm because the fused
+                # Q/KV insert consumes one slot per local Q row. The compressor
+                # gathers its input projections across PCP ranks, though, so
+                # the compressed target slots must be padded and gathered too.
+                # Without this, a rank whose local chunks contain no 128-token
+                # boundary hands the compressor an all--1 map for every
+                # gathered row, leaving its C128 KV cache empty.
+                _, _, num_decode_tokens, _ = split_decodes_and_prefills(
+                    cm, decode_threshold=self.reorder_batch_threshold or 1
+                )
+                padded_num_tokens = cm.slot_mapping.shape[0]
+                slot_mapping = _gather_pcp_prefill_slot_mapping(
+                    self.compressed_slot_mapping_buffer[:padded_num_tokens],
+                    num_decode_tokens,
+                )
 
         c128a_fields: dict[str, torch.Tensor | None] = {}
         if self.compress_ratio == 128:

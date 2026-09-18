@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -15,6 +16,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -114,24 +116,22 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
-        # gate_up_proj B-preshuffle (ColumnParallel -> no all-reduce); set at load.
-        self._gateup = rocm_aiter_ops.is_enabled()
-        # Block scale for the preshuffled gate_up weight; None = not preshuffled.
+        self._aiter_enabled = rocm_aiter_ops.is_enabled()
+        # Block scales for the B-preshuffled weights; None = not preshuffled.
         self._gateup_scale: torch.Tensor | None = None
+        self._down_scale: torch.Tensor | None = None
 
-    def prepare_gateup_preshuffle(self) -> None:
-        # B-preshuffle the gate_up_proj weight in place (single weight).
-        if not self._gateup:
-            return
+    def _preshuffle_weight(self, linear: nn.Module) -> torch.Tensor | None:
+        """Shuffle a linear's weight in place and hand back its block scale."""
         from vllm.model_executor.utils import replace_parameter
 
-        w = getattr(self.gate_up_proj, "weight", None)
-        ws = getattr(self.gate_up_proj, "weight_scale_inv", None)  # per-block scale
+        w = getattr(linear, "weight", None)
+        ws = getattr(linear, "weight_scale_inv", None)  # per-block scale
         if w is None or ws is None or w.dim() != 2:
-            return
+            return None
         # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
         if w.shape[-1] % 128 != 0 or w.shape[0] % 16 != 0:
-            return
+            return None
         if ws.dtype == torch.float8_e8m0fnu:
             from vllm.model_executor.layers.quantization.utils.fp8_utils import (
                 _upcast_e8m0_to_fp32,
@@ -139,27 +139,51 @@ class DeepseekV4MLP(nn.Module):
 
             ws = _upcast_e8m0_to_fp32(ws).contiguous()
         replace_parameter(
-            self.gate_up_proj,
+            linear,
             "weight",
             rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
         )
-        self._gateup_scale = ws
+        return ws
+
+    def prepare_mlp_preshuffle(self) -> None:
+        if not self._aiter_enabled:
+            return
+        self._gateup_scale = self._preshuffle_weight(self.gate_up_proj)
+        # down_proj was the last shape in the model still hitting "not found
+        # tuned config" on the non-preshuffled entry point, which left it at
+        # 114 us against gate_up's 67 for a smaller GEMM. Taking the
+        # preshuffled entry point is what gets it a tuned config; the layout
+        # change is incidental. Bypassing the linear also bypasses its bias and
+        # its input split, so only take it when neither is in play.
+        if (
+            os.getenv("VLLM_DSV4_DOWN_PROJ_PRESHUFFLE", "1") != "0"
+            and self.down_proj.bias is None
+            and self.down_proj.input_is_parallel
+        ):
+            self._down_scale = self._preshuffle_weight(self.down_proj)
+
+    def _bpreshuffle_gemm(
+        self, x: torch.Tensor, linear: nn.Module, weight_scale: torch.Tensor
+    ) -> torch.Tensor:
+        x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
+        return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            x_fp8, linear.weight, x_scale, weight_scale, output_dtype=x.dtype
+        )
 
     def forward(self, x):
         if self._gateup_scale is not None and x.dim() == 2:
             # gate_up via fp8 group-quant (col-major) + B-preshuffle GEMM.
-            x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
-            gate_up = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
-                x_fp8,
-                self.gate_up_proj.weight,
-                x_scale,
-                self._gateup_scale,
-                output_dtype=x.dtype,
-            )
+            gate_up = self._bpreshuffle_gemm(x, self.gate_up_proj, self._gateup_scale)
         else:
             gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if self._down_scale is not None and x.dim() == 2:
+            x = self._bpreshuffle_gemm(x, self.down_proj, self._down_scale)
+            # down_proj is RowParallel, so its reduction is ours to do now.
+            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+                x = tensor_model_parallel_all_reduce(x)
+        else:
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -580,9 +604,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         self.device = current_platform.device_type
-        # Reserved topk indices buffer for all Indexer layers to reuse.
+        # Reserved topk indices buffer for all Indexer layers to reuse. Under
+        # PCP the indexer runs on the post-all-gather tokens, so the buffer has
+        # to cover pcp_size times the per-rank budget.
         self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.scheduler_config.max_num_batched_tokens
+            * vllm_config.parallel_config.prefill_context_parallel_size,
             config.index_topk,
             dtype=torch.int32,
             device=self.device,
@@ -1050,7 +1077,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
                 fused_compressor_layers += module.prepare_compressor_gemm_fusion()
                 module.prepare_attn_preshuffle()
             elif isinstance(module, DeepseekV4MLP):
-                module.prepare_gateup_preshuffle()
+                module.prepare_mlp_preshuffle()
         if fused_compressor_layers:
             logger.info(
                 "Fused the C4 compressor GEMMs in %d DeepSeek V4 layers",

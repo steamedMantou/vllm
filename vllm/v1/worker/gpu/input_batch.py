@@ -112,6 +112,16 @@ class InputBatch:
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
 
+    # PCP's rank-major version of ``is_padding``. It is derived while building
+    # the rank layout and lets every MoE layer reuse one mask instead of
+    # all-gathering the same bool tensor again.
+    pcp_gathered_is_padding: torch.Tensor | None = None
+
+    # Indices of C128 compression-boundary rows in the rank-major gathered
+    # prefill layout. None for mixed/decode batches and when the optimization
+    # is disabled.
+    pcp_c128_boundary_indices: torch.Tensor | None = None
+
     @classmethod
     def make_dummy(
         cls,

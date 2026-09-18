@@ -416,3 +416,61 @@ def test_deepseek_v4_mhc_broadcast_refit_refreshes_in_place(monkeypatch):
     assert layer.hc_attn_fn_broadcast is buffer
     expected = layer.hc_attn_fn.detach().view(-1, 2, 8).sum(dim=1)
     assert torch.equal(layer.hc_attn_fn_broadcast, expected)
+
+
+def test_aiter_mhc_large_m_path_is_strictly_opt_in(monkeypatch):
+    """The experimental AITER route must not change default call behavior."""
+    aiter_mhc = pytest.importorskip("aiter.ops.mhc")
+
+    import vllm.envs as envs
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    seen: list[dict[str, bool | int]] = []
+
+    def fake_mhc_fused_post_pre(*args, **kwargs):
+        seen.append(kwargs)
+        x, residual, post_mix, comb_mix = args[:4]
+        # Match AITER's (post, comb, layer_input, residual) result order.
+        return post_mix, comb_mix, x, residual
+
+    monkeypatch.setattr(aiter_mhc, "mhc_fused_post_pre", fake_mhc_fused_post_pre)
+    m, hc_mult, hidden_size = 2, 4, 256
+    x = torch.empty(m, hidden_size, dtype=torch.bfloat16)
+    residual = torch.empty(m, hc_mult, hidden_size, dtype=torch.bfloat16)
+    post_mix = torch.empty(m, hc_mult, 1, dtype=torch.float32)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=torch.float32)
+    fn = torch.empty(hc_mult * (hc_mult + 2), hc_mult * hidden_size)
+    hc_scale = torch.empty(3)
+    hc_base = torch.empty(hc_mult * (hc_mult + 2))
+
+    kwargs = dict(
+        x=x,
+        residual=residual,
+        post_layer_mix=post_mix,
+        comb_res_mix=comb_mix,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+    )
+    monkeypatch.setattr(envs, "VLLM_DSV4_MHC_FORCE_LARGE_M", False)
+    monkeypatch.setattr(envs, "VLLM_DSV4_MHC_FN_PACK_BF16", False)
+    rocm_aiter_ops.mhc_fused_post_pre(**kwargs)
+    assert seen[-1] == {}
+
+    monkeypatch.setattr(envs, "VLLM_DSV4_MHC_FORCE_LARGE_M", True)
+    rocm_aiter_ops.mhc_fused_post_pre(**kwargs)
+    assert seen[-1] == {"force_fused": True}
+
+    monkeypatch.setattr(envs, "VLLM_DSV4_MHC_FORCE_LARGE_M", False)
+    monkeypatch.setattr(envs, "VLLM_DSV4_MHC_FN_PACK_BF16", True)
+    rocm_aiter_ops.mhc_fused_post_pre(**kwargs)
+    assert seen[-1] == {"is_fn_pack_bf16": 1}
+
+    monkeypatch.setattr(envs, "VLLM_DSV4_MHC_FORCE_LARGE_M", True)
+    rocm_aiter_ops.mhc_fused_post_pre(**kwargs)
+    assert seen[-1] == {"force_fused": True, "is_fn_pack_bf16": 1}

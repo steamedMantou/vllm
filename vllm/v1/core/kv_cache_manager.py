@@ -802,12 +802,17 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
-        for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+    def take_new_block_ids(self) -> list[list[int]]:
+        """Drain and return new attention block IDs for zeroing, per group.
+
+        Indexed by ``kv_cache_group_id``: the managers are built in group
+        order, and the worker needs to know which group each block belongs to
+        so it only clears that group's own layers.
+        """
+        return [
+            mgr.take_new_block_ids()
+            for mgr in self.coordinator.single_type_managers
+        ]
 
     def get_zeroing_block_ids_in_range(
         self, request_id: str, start_token: int, end_token: int

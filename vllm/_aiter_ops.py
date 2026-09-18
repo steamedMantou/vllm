@@ -3630,6 +3630,14 @@ class rocm_aiter_ops:
                 ),
             )
 
+        # AITER's large-M route uses temporal post stores on gfx950. Keep the
+        # keyword absent by default: older AITER builds did not expose it, and
+        # the default route remains unchanged.
+        mhc_kwargs: dict[str, bool | int] = {}
+        if envs.VLLM_DSV4_MHC_FORCE_LARGE_M:
+            mhc_kwargs["force_fused"] = True
+        if envs.VLLM_DSV4_MHC_FN_PACK_BF16:
+            mhc_kwargs["is_fn_pack_bf16"] = 1
         with torch.device(residual_flat.device):
             post_mix, comb_mix, layer_input, next_residual = mhc_fused_post_pre(
                 x_flat,
@@ -3646,6 +3654,7 @@ class rocm_aiter_ops:
                 sinkhorn_repeat,
                 norm_weight,
                 norm_eps,
+                **mhc_kwargs,
             )
 
         return (

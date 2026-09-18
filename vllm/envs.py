@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
+    VLLM_DSV4_PREFILL_ASM: bool = False
     VLLM_ROCM_AITER_MLA_ASM_PADDING: Literal["auto", "gluon", "asm"] = "auto"
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
@@ -148,6 +149,22 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+    VLLM_DSV4_FP8_BMM: bool = True
+    VLLM_DSV4_WQ_B_PRESHUFFLE: bool = False
+    VLLM_DSV4_INDEXER_WQ_B_PRESHUFFLE: bool = False
+    VLLM_DSV4_MHC_FORCE_LARGE_M: bool = False
+    VLLM_DSV4_MHC_FN_PACK_BF16: bool = False
+    VLLM_DSV4_INDEXER_LOGITS_INF_FILL: bool = False
+    VLLM_DSV4_MQA_LOGITS_IMPL: Literal["gluon", "preshuffle"] = "gluon"
+    VLLM_DSV4_MOE_ALLGATHER_FP8: bool = True
+    VLLM_DSV4_MOE_A4W4: bool = False
+    VLLM_DSV4_MOE_LOG_SHAPES: bool = False
+    VLLM_DSV4_MOE_COALESCED_ALLGATHER: bool = False
+    VLLM_DSV4_C4_COALESCED_ALLGATHER: bool = False
+    VLLM_DSV4_MOE_LOCAL_ROUTING: bool = True
+    VLLM_PCP_COMM_NVTX: bool = False
+    VLLM_PCP_COMM_GPU_TIMING: bool = False
+    VLLM_DSV4_C128_COMPACT: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1281,6 +1298,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MLA", "True").lower() in ("true", "1")
     ),
+    # Run DSv4 sparse prefill on aiter's assembly kernel, which reads the paged
+    # fp8 cache in place. It addresses a page as whole 576B rows, so the KV
+    # pages are aligned to 576B rather than 512B when this is on.
+    "VLLM_DSV4_PREFILL_ASM": lambda: (
+        os.getenv("VLLM_DSV4_PREFILL_ASM", "False").lower() in ("true", "1")
+    ),
     # Small-head (<16) AITER MLA decode kernel selection. Small head counts
     # (e.g. Kimi-K3: 12 heads/rank at TP8, 6 at TP16) can decode either through
     # the Gluon small-head kernel or through the padded persistent-scheduling
@@ -1330,6 +1353,256 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
         in ("true", "1")
+    ),
+    # Run the DeepSeek-V4 wo_a bmm in fp8 off the checkpoint's e8m0 scales,
+    # with the activation quant folded into the inverse-RoPE kernel.
+    #
+    # The trade is one extra pass over the attention output. The fp8 path
+    # cannot use the in-place inverse RoPE -- the output dtype differs from the
+    # input, so every lane has to be written -- and that conversion is 470 MB
+    # read plus 235 MB written that the bf16 einsum never pays. It buys a
+    # faster GEMM. Per layer-step, from one kernel trace of the real
+    # rocm_inv_rope_einsum entry point at the deployed shapes
+    # (b16 n1024 k4096; M = max_num_batched_tokens/8):
+    #
+    #            RoPE    GEMM   total
+    #   M=3584   21.7   437.1   458.8  bf16 (in-place RoPE + torch.einsum)
+    #            118.5  268.8   387.3  fp8   -> -71.5 us
+    #   M=2048   12.2   223.9   236.1  bf16
+    #            67.7   150.2   217.9  fp8   -> -18.2 us
+    #
+    # A 102400-token request is three M=3584 chunks plus one M=2048 tail, so
+    # 61 layers * (3*71.5 + 18.2) = 14.2 ms of kernel time. The end-to-end A/B
+    # shows -6 ms (2151 -> 2145), the rest being absorbed by overlap.
+    #
+    # Note the margin is NOT a precision effect. fp8 gets 1744 TFLOPS here
+    # against bf16's 1052 through torch.einsum, but einsum is the weak part of
+    # that comparison: it lands on a hipBLASLt MT256x224x64 tile for N=1024,
+    # and the same math through torch.bmm on strided views is 408 us. Against
+    # that better baseline fp8 wins by ~43 us, not 71.
+    #
+    # Both sides are near their practical limits at this shape:
+    #   - opus already picks the fast scaled MFMA (65536 FLOP per
+    #     SQ_INSTS_MFMA, v_mfma_scale_f32_16x16x128_f8f6f4) and kid158 beats
+    #     every other codegen instance; re-tuning the full pool finds nothing.
+    #     The 1744 TFLOPS is wave quantization, not the kernel -- see the
+    #     kid158 note in aiter's opus_gemm_common.py.
+    #   - the quantizing RoPE's 118.5 us is already the measured 5.9 TB/s
+    #     bf16 -> fp8 conversion bound for 705 MB.
+    # Chunking M to overlap the two also backfires: M=896 in four launches
+    # costs 682.8 us against 270.8 for one launch at M=3584.
+    #
+    # Bigger M still helps for the reason it always did -- the conversion is
+    # linear in M while the GEMM's efficiency rises -- so a configuration that
+    # does not shard tokens (PP) wants this on regardless.
+    #
+    # What would actually move it is a batched fp8 GEMM that reads bf16 A and
+    # quantizes in its own prologue, deleting the conversion pass outright:
+    # 268.8 us for the whole stage against 387.3 today, ~21 ms of kernel time.
+    # Nothing in aiter does that for this shape (batched_gemm_a16wfp4 is the
+    # only bf16-A batched entry, it needs fp4 weights, and at 2597 us it is
+    # 6.7x slower than the bf16 einsum here). opus cannot be extended into it
+    # cheaply either: it streams A global -> LDS with buffer_load ... lds, which
+    # never routes through VGPRs, so an in-flight quant means replacing that
+    # with VGPR staging plus a cross-lane amax and ds_write, in a hand-scheduled
+    # mainloop whose s_waitcnt gates are written in terms of the buffer_load
+    # count and which is already at its VGPR budget.
+    "VLLM_DSV4_FP8_BMM": lambda: (
+        os.getenv("VLLM_DSV4_FP8_BMM", "True").lower() in ("true", "1")
+    ),
+    # Preshuffle DeepSeek-V4's main wq_b projection only. The C4 indexer's
+    # smaller N=8192 projection has a separate gate because a generic M=96
+    # Triton configuration is not numerically safe for PCP.
+    "VLLM_DSV4_WQ_B_PRESHUFFLE": lambda: (
+        os.getenv("VLLM_DSV4_WQ_B_PRESHUFFLE", "False").lower() in ("true", "1")
+    ),
+    "VLLM_DSV4_INDEXER_WQ_B_PRESHUFFLE": lambda: (
+        os.getenv("VLLM_DSV4_INDEXER_WQ_B_PRESHUFFLE", "False").lower()
+        in ("true", "1")
+    ),
+    # On gfx950, the default AITER mHC post+pre route uses non-temporal
+    # stores above 8 CUs. Its explicitly selected large-M route instead uses
+    # temporal stores. Keep this opt-in until it has been validated on the
+    # deployment's exact prefill shapes.
+    "VLLM_DSV4_MHC_FORCE_LARGE_M": lambda: (
+        os.getenv("VLLM_DSV4_MHC_FORCE_LARGE_M", "False").lower()
+        in ("true", "1")
+    ),
+    # Use AITER's bf16 hi/lo MHC-FN MFMA path on gfx950. This is an
+    # approximation of the fp32-FN path, so it remains opt-in pending
+    # end-to-end accuracy validation.
+    "VLLM_DSV4_MHC_FN_PACK_BF16": lambda: (
+        os.getenv("VLLM_DSV4_MHC_FN_PACK_BF16", "False").lower()
+        in ("true", "1")
+    ),
+    # Pre-fill the sparse indexer's MQA logits with -inf before the kernel
+    # writes them. Off by default: it is an escape hatch, not a speedup.
+    #
+    # aiter's fp8_mqa_logits defaults to clean_logits=True, which allocates the
+    # [M, N] fp32 output with torch.full(-inf) so that positions outside row
+    # i's [ks, ke) read as -inf. Its docstring says the flag also makes the
+    # kernel write those positions itself, but the gluon launch never receives
+    # it, so on gfx950 the fill is all the flag does -- a full-buffer write
+    # ahead of every one of the 120 calls per request, 294 MiB at step 3, and
+    # 7.8 ms per 100k prefill by itself.
+    #
+    # Nothing reads what it writes. The logits' only consumer is
+    # top_k_per_row_prefill, and both the aiter and the native implementation
+    # take the same cu_seqlen_ks/ke and scan only [ks, ke) per row. Confirmed
+    # empirically: with the fill dropped, the out-of-range positions do hold
+    # garbage (0 of 3583 are -inf past ke) and the top-k still selects the same
+    # set for every row across 8 seeds, while two runs of the filled path
+    # already disagree on one row -- the residue is the kernel's tie breaking,
+    # not the fill. Set this to 1 if a future consumer starts reading outside
+    # [ks, ke).
+    "VLLM_DSV4_INDEXER_LOGITS_INF_FILL": lambda: (
+        os.getenv("VLLM_DSV4_INDEXER_LOGITS_INF_FILL", "False").lower()
+        in ("true", "1")
+    ),
+    # Select the sparse-indexer prefill MQA implementation on gfx950.
+    # "gluon" keeps AITER's existing raw-KV implementation; "preshuffle"
+    # uses dense_mqa's raw-KV -> packed-KV HIP path.
+    #
+    # preshuffle is the faster one and launch_service/serve.sh selects it, but
+    # the default stays gluon: preshuffle raises off gfx950, without dense_mqa
+    # importable, or on any q but [M,64,128], so defaulting to it would turn
+    # working setups into hard failures rather than slower ones.
+    "VLLM_DSV4_MQA_LOGITS_IMPL": env_with_choices(
+        "VLLM_DSV4_MQA_LOGITS_IMPL", "gluon", ["gluon", "preshuffle"]
+    ),
+    # Carry the MoE expert input across the PCP all-gather as MXFP8 instead of
+    # bf16.
+    #
+    # With EP off the 8 PCP ranks are flattened into an 8-way MoE TP group, so
+    # every rank needs every token and the layer all-gathers the expert input.
+    # That gather gets 28672x7168 bf16 to each rank, is the most expensive
+    # collective in the layer at ~1220 us per layer-step, and the AITER experts
+    # quantize what it delivers to MXFP8 as their very first act. Quantizing
+    # before the gather instead moves 7392 bytes per token rather than 14336.
+    #
+    # Worth 117 ms of TTFT at 100k (2277 -> 2160, distributions disjoint over 9
+    # runs each), and the experts see byte-identical operands either way.
+    #
+    # Two separate things have to hold for that. The quantization reorders
+    # cleanly: MXFP8 scales each 32-wide group along the hidden dim, so a row's
+    # payload and scales depend only on that row and the gather only
+    # concatenates rows -- quantizing per rank and concatenating is bitwise
+    # identical to quantizing the gathered batch, including for rows whose group
+    # maxima sit exactly on a power of two where the e8m0 rounding is at its tie
+    # (test_mxfp8_roundtrip.py).
+    #
+    # And we have to quantize with the same kernel aiter would have. That one
+    # cost a round of debugging: MX leaves the scale rounding open, aiter carries
+    # several, and its Triton dynamic_mxfp8_quant picks a scale one octave
+    # coarser than per_1x32_mx_quant_hip on ~0.3% of groups. Numerically that is
+    # nothing -- in the mismatching groups the operands still multiply back to
+    # the same value -- but the coarser scale costs the group's other elements a
+    # mantissa bit, and greedy decode came off the baseline within a few dozen
+    # characters. Quantizing through the HIP entry that aiter's own bf16 path
+    # reaches makes both entries bit-identical (check_mxfp8_gather_paths.py).
+    #
+    # Only applies to the AITER_MXFP4_BF16 experts, which are the ones that
+    # quantize to MXFP8 internally, and only above a gathered-token floor --
+    # below it aiter serves the experts from its flydsl kernels, which assume
+    # bf16 input and hang outright on FP8.
+    "VLLM_DSV4_MOE_ALLGATHER_FP8": lambda: (
+        os.getenv("VLLM_DSV4_MOE_ALLGATHER_FP8", "True").lower() in ("true", "1")
+    ),
+    # Run the routed experts as MXFP4 x MXFP4 (A4W4) instead of MXFP8 x MXFP4
+    # (A8W4). The weights are MXFP4 either way -- expert_dtype is fp4 in the
+    # checkpoint -- so this only moves the activation side.
+    #
+    # Two things change together, and they have to change together:
+    #
+    #   1. The PCP expert-input gather quantizes to MXFP4 rather than MXFP8.
+    #      Per token that is 3584 payload + 224 scale = 3808 bytes against
+    #      7392, on the layer's most expensive collective. This is the larger
+    #      and the more predictable half of the win.
+    #   2. AITER picks the activation dtype from (activation, gate_mode). For
+    #      SiLU the fp8 branch is taken whenever gate_mode is INTERLEAVE, and
+    #      the fp4x2 branch is the SEPARATED fallthrough, so A4W4 means asking
+    #      for SEPARATED and shuffling w13 to match. There is no interleaved
+    #      A4W4 kernel to ask for instead: every flydsl_moe1_afp4_* kernel in
+    #      the tuned and untuned tables is separated-layout, none carry the
+    #      _gui_ tag their afp8 counterparts do.
+    #
+    # Because (2) changes the weight layout chosen at load time, this is a
+    # launch-time switch. It cannot be flipped against a running server, and a
+    # server started with it on has w13 shuffled in a layout the A8W4 opus
+    # kernels would misread.
+    #
+    # Off by default, and deliberately so. A8W4 on this model runs the tuned
+    # opus_moe_stage1/stage2_a8w4 kernels; A4W4 leaves opus entirely for the
+    # flydsl port, whose tuned table (kimik3_a4w4_tuned_fmoe.csv) covers
+    # Kimi-K3 shapes at decode M, not DeepSeek-V4-Pro's 7168/3072/384/top-6 at
+    # prefill M. Expect to have to tune before A4W4 is faster, not after.
+    "VLLM_DSV4_MOE_A4W4": lambda: (
+        os.getenv("VLLM_DSV4_MOE_A4W4", "False").lower() in ("true", "1")
+    ),
+    # Log each distinct expert-call shape once, to match a run against aiter's
+    # fused-MoE tuning tables. The shape the kernels see is not the model's:
+    # with EP off the PCP ranks flatten into a MoE TP group that shards
+    # inter_dim, so a 3072 model runs 3072/tp per rank, and which tuned entry
+    # aiter finds turns on that number. Diagnostic only.
+    "VLLM_DSV4_MOE_LOG_SHAPES": lambda: (
+        os.getenv("VLLM_DSV4_MOE_LOG_SHAPES", "False").lower() in ("true", "1")
+    ),
+    # Issue the MXFP8 payload and E8M0-scale all-gathers as one ProcessGroup
+    # batch, while keeping each gathered output contiguous for Opus MoE.
+    # Opt-in because it relies on PyTorch's ProcessGroup coalescing support.
+    "VLLM_DSV4_MOE_COALESCED_ALLGATHER": lambda: (
+        os.getenv("VLLM_DSV4_MOE_COALESCED_ALLGATHER", "False").lower()
+        in ("true", "1")
+    ),
+    # Batch the main C4 compressor and C4 indexer compressor payload gathers.
+    # They still retain separate rank-major contiguous outputs and descriptors.
+    "VLLM_DSV4_C4_COALESCED_ALLGATHER": lambda: (
+        os.getenv("VLLM_DSV4_C4_COALESCED_ALLGATHER", "False").lower()
+        in ("true", "1")
+    ),
+    # Route on the local tokens and send the top-k across the gather, instead of
+    # sending the router logits across and having every rank route the whole
+    # gathered batch.
+    #
+    # The same PCP-flattens-to-TP shape as above: the gate already runs on the
+    # local tokens, but its output crosses the gather and select_experts then
+    # runs on all 28672 rows on all 8 ranks, so 7/8 of topkGatingSoftplusSqrt
+    # (15.2 ms per request over 244 layer-steps) recomputes what a peer just
+    # computed. Routing before the gather deletes that, and top-k over 384
+    # experts is per-token -- a token's experts depend on its own logits and the
+    # fixed correction bias, nothing else -- so routing the shards and
+    # concatenating gives the same ids and weights as routing the concatenation.
+    #
+    # The bigger half of the win is on the wire. Logits are 384 fp32 per token,
+    # 1536 bytes; the top-6 ids and weights are 48. Against the 7392 bytes the
+    # MXFP8 expert input costs, the logits were 17% of the dispatch traffic and
+    # the top-k is 0.6%. And the payload is small enough to ride along on the
+    # scale panel of the expert-input gather rather than take a collective of
+    # its own, so the layer ends up issuing one fewer than it does today.
+    #
+    # Off unless the routing is genuinely per-token and unobserved: EPLB records
+    # expert load off topk_ids and would see an eighth of the batch, and the
+    # routing-replay capture hooks expect the gathered ids. Both fall back to
+    # gathering logits.
+    "VLLM_DSV4_MOE_LOCAL_ROUTING": lambda: (
+        os.getenv("VLLM_DSV4_MOE_LOCAL_ROUTING", "True").lower() in ("true", "1")
+    ),
+    # Emit ROCTx ranges around PCP collectives for call-site attribution in
+    # rocprofv3 (--marker-trace --kernel-rename). Off in normal serving.
+    "VLLM_PCP_COMM_NVTX": lambda: (
+        os.getenv("VLLM_PCP_COMM_NVTX", "False").lower() in ("true", "1")
+    ),
+    # Synchronize once after a model forward and report CUDA-event elapsed time
+    # for the PCP ranges above. Diagnostic-only: it deliberately trades
+    # asynchronous scheduling for precise, profiler-free attribution.
+    "VLLM_PCP_COMM_GPU_TIMING": lambda: (
+        os.getenv("VLLM_PCP_COMM_GPU_TIMING", "False").lower() in ("true", "1")
+    ),
+    # Use metadata-derived C128 boundary indices to launch the sparse two-stage
+    # compressor only for rows that finish a 128-token block. Experimental
+    # until end-to-end PCP validation completes.
+    "VLLM_DSV4_C128_COMPACT": lambda: (
+        os.getenv("VLLM_DSV4_C128_COMPACT", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.

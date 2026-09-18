@@ -6,7 +6,10 @@ from functools import lru_cache
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.logger import init_logger
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -17,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -231,6 +235,50 @@ def rocm_aiter_grouped_topk(
     return topk_weights, topk_ids
 
 
+logger = init_logger(__name__)
+
+# Shapes already reported under VLLM_DSV4_MOE_LOG_SHAPES, so a 61-layer forward
+# logs once rather than once per layer per step.
+_LOGGED_MOE_SHAPES: set[tuple] = set()
+
+
+def _mxfp4_packed_dtype() -> torch.dtype:
+    """The dtype MXFP4 activations arrive in, two values to the byte.
+
+    Older torch builds have no float4 dtype and aiter falls back to uint8, so
+    resolve it the same way aiter.dtypes does rather than naming it directly.
+    """
+    return getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+
+
+def _is_prequantized_moe_input(hidden_states: torch.Tensor) -> bool:
+    """Whether the expert input already crossed the PCP gather quantized.
+
+    Both schemes are recognised: MXFP8 leaves an fp8 tensor of the full hidden
+    width, MXFP4 an fp4x2 tensor of half of it. Neither is a dtype the experts
+    would see from an ordinary bf16 forward, so the dtype alone is the signal.
+    """
+    return hidden_states.dtype in (
+        current_platform.fp8_dtype(),
+        _mxfp4_packed_dtype(),
+    )
+
+
+def _logical_hidden_dim(hidden_states: torch.Tensor) -> int:
+    """hidden_states' hidden dim in values, undoing MXFP4's 2-per-byte packing.
+
+    Only the fp4x2 case is packed. fp8 and bf16 both store one value per
+    element, so their trailing extent is already the logical width.
+
+    Reads shape[-1] rather than shape[1] because moe_problem_size is also
+    reached with a 3D (E, M, K) activation.
+    """
+    width = hidden_states.shape[-1]
+    if hidden_states.dtype == _mxfp4_packed_dtype():
+        return width * 2
+    return width
+
+
 def rocm_aiter_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -340,7 +388,11 @@ def rocm_aiter_fused_experts(
         intermediate_pad = 0
         assert moe_config.hidden_dim_unpadded is not None
         assert moe_config.intermediate_size_per_partition_unpadded is not None
-        hidden_pad = hidden_states.shape[1] - moe_config.hidden_dim_unpadded
+        # Not shape[1]: under A4W4 the activation is fp4x2 and shape[1] is half
+        # the hidden dim, which would make this pad negative and drive the
+        # kernel's padding logic off a cliff. The pad is a property of the
+        # hidden dim, not of how many bytes it currently takes.
+        hidden_pad = _logical_hidden_dim(hidden_states) - moe_config.hidden_dim_unpadded
         intermediate_pad = (
             (
                 moe_config.intermediate_size_per_partition
@@ -371,6 +423,29 @@ def rocm_aiter_fused_experts(
         # Hence, we pass in GateMode.INTERLEAVE to match the weight shuffling.
         from aiter.ops.flydsl.moe_common import GateMode
 
+        # One line per distinct expert-call shape, for matching a run against
+        # aiter's tuning tables. Which entry aiter picks is keyed on M, the
+        # per-rank inter_dim and the activation dtype, and none of those are
+        # obvious from the launch config -- EP-off flattens PCP into MoE TP and
+        # shards inter_dim, so the shape the kernels see is not the model's.
+        # Off unless VLLM_DSV4_MOE_LOG_SHAPES=1; deduplicated, so it cannot
+        # turn into per-layer spam.
+        if envs.VLLM_DSV4_MOE_LOG_SHAPES:
+            key = (
+                hidden_states.shape[0],
+                _logical_hidden_dim(hidden_states),
+                w1.shape[1] // 2,
+                str(hidden_states.dtype),
+            )
+            if key not in _LOGGED_MOE_SHAPES:
+                _LOGGED_MOE_SHAPES.add(key)
+                logger.info(
+                    "AITER MoE shape: M=%d model_dim=%d inter_dim(per rank)=%d "
+                    "E=%d topk=%d act_dtype=%s hidden_pad=%d intermediate_pad=%d",
+                    key[0], key[1], key[2], w1.shape[0], topk_ids.shape[1],
+                    key[3], hidden_pad, intermediate_pad,
+                )
+
         gate_mode = ""
         if activation == MoEActivation.SITU:
             # a8w4 (VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4=1) uses the gate/up-
@@ -382,7 +457,18 @@ def rocm_aiter_fused_experts(
                 else GateMode.SEPARATED.value
             )
         elif quant_config.use_mxfp4_w4a16:
-            gate_mode = GateMode.INTERLEAVE.value
+            # A4W4 has to ask for SEPARATED, and not as a preference: for SiLU
+            # aiter picks the activation dtype from gate_mode, taking fp8 on
+            # INTERLEAVE and reaching fp4x2 only on the SEPARATED fallthrough.
+            # There is no interleaved A4W4 kernel to ask for instead -- every
+            # flydsl_moe1_afp4_* entry in the tuned and untuned tables is
+            # separated-layout, none carry the _gui_ tag the afp8 ones do.
+            # oracle/mxfp4.py shuffles w13 to match off the same env var.
+            gate_mode = (
+                GateMode.SEPARATED.value
+                if envs.VLLM_DSV4_MOE_A4W4
+                else GateMode.INTERLEAVE.value
+            )
         elif activation_interleave is not None:
             gate_mode = (
                 GateMode.INTERLEAVE.value
@@ -499,6 +585,30 @@ class AiterExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        """K from the hidden dim, not from the activation's trailing extent.
+
+        The base implementation reads K off ``a1.size(-1)``, which is the same
+        thing for bf16 and for MXFP8 but not for MXFP4: fp4x2 packs two values
+        per byte, so a pre-quantized A4W4 input arrives 3584 wide for a hidden
+        dim of 7168. K feeds workspace_shapes, which sizes the *output* buffer
+        -- and the output is bf16 at the full hidden dim regardless of how the
+        input was quantized, so leaving it packed makes the experts' result and
+        the buffer it is copied into disagree by exactly 2x.
+
+        The base docstring anticipates this case ("the int4 kernels divide the
+        trailing dimension by two, so it's not 'correct' to extract N or K from
+        the trailing dimension") and invites the override.
+        """
+        E, M, N, K, topk = super().moe_problem_size(a1, w1, w2, topk_ids)
+        return E, M, N, _logical_hidden_dim(a1), topk
+
     def workspace_shapes(
         self,
         M: int,
@@ -542,6 +652,20 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             num_local_tokens = expert_tokens_meta.expert_num_tokens
         else:
             num_local_tokens = None
+
+        if a1q_scale is None and _is_prequantized_moe_input(hidden_states):
+            # The PCP all-gather carried the expert input already quantized to
+            # save bytes on the wire, so the scales come from the forward
+            # context rather than from prepare(). aiter recognises the
+            # pre-quantized pair and skips the quantization it usually fuses
+            # into the sort -- it has one such branch per scheme, keyed on the
+            # activation dtype being fp8 or fp4x2 with a1_scale set. See
+            # MoERunner._pcp_all_gather_expert_input.
+            a1q_scale = get_forward_context().pcp_moe_a1q_scale
+            assert a1q_scale is not None, (
+                "AITER experts got pre-quantized activations with no MX scales; "
+                "the gather quantized them but the scales did not survive"
+            )
 
         result = rocm_aiter_fused_experts(
             hidden_states=hidden_states,

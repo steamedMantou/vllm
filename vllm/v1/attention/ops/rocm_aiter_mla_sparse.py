@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -753,12 +754,77 @@ def mqa_logits_module():
     return None
 
 
+@functools.cache
+def _preshuffle_mqa_logits() -> Callable[..., torch.Tensor]:
+    """Lazily import the optional gfx950 packed-KV HIP implementation."""
+    try:
+        from dense_mqa import dense_mqa_logits
+    except ImportError as exc:
+        raise RuntimeError(
+            "VLLM_DSV4_MQA_LOGITS_IMPL=preshuffle requires dense_mqa. "
+            "Add /app/dense_fp8_mqa to PYTHONPATH before starting vLLM."
+        ) from exc
+    return dense_mqa_logits
+
+
+def _rocm_fp8_mqa_logits_preshuffle(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    """Run the gfx950 dense-MQA kernel on its packed-KV fast path."""
+    if not _ON_GFX950:
+        raise RuntimeError(
+            "VLLM_DSV4_MQA_LOGITS_IMPL=preshuffle is only supported on gfx950."
+        )
+
+    k_fp8, scale = kv
+    if q.ndim != 3 or tuple(q.shape[1:]) != (64, 128):
+        raise ValueError(
+            "preshuffle MQA requires q shaped [M, 64, 128], got "
+            f"{tuple(q.shape)}."
+        )
+    if k_fp8.ndim != 2 or k_fp8.shape[1] != 128:
+        raise ValueError(
+            "preshuffle MQA requires KV shaped [N, 128], got "
+            f"{tuple(k_fp8.shape)}."
+        )
+    if q.dtype != torch.float8_e4m3fn or k_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "preshuffle MQA requires q and KV to use torch.float8_e4m3fn."
+        )
+
+    # dense_mqa writes only the causal window. Keep AITER's public
+    # clean_logits contract when another consumer needs invalid positions.
+    out_shape = (q.shape[0], k_fp8.shape[0])
+    if clean_logits:
+        out = torch.full(
+            out_shape, -float("inf"), dtype=torch.float32, device=q.device
+        )
+    else:
+        out = torch.empty(out_shape, dtype=torch.float32, device=q.device)
+
+    return _preshuffle_mqa_logits()(
+        q,
+        k_fp8,
+        scale,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        out=out,
+    )
+
+
 def rocm_fp8_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool = True,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits for a single sequence without KV paging.
 
@@ -773,14 +839,28 @@ def rocm_fp8_mqa_logits(
             shape [M], dtype int32.
         cu_seqlen_ke: End indices (exclusive) for valid K per query position,
             shape [M], dtype int32.
+        clean_logits: Whether positions outside row i's [ks, ke) have to come
+            back as -inf. Costs a full [M, N] fp32 fill of the output before
+            the kernel runs, so pass False when the consumer bounds itself by
+            the same ks/ke.
 
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
 
-    from vllm._aiter_ops import rocm_aiter_ops
-
     k_fp8, scale = kv
+
+    if envs.VLLM_DSV4_MQA_LOGITS_IMPL == "preshuffle":
+        return _rocm_fp8_mqa_logits_preshuffle(
+            q,
+            (k_fp8, scale),
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            clean_logits,
+        )
+
+    from vllm._aiter_ops import rocm_aiter_ops
 
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
         from aiter.ops.flydsl import flydsl_fp8_mqa_logits
@@ -795,7 +875,15 @@ def rocm_fp8_mqa_logits(
 
     if aiter_mqa_logits_module is not None:
         fp8_mqa_logits = aiter_mqa_logits_module.fp8_mqa_logits
-        return fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
+        return fp8_mqa_logits(
+            q,
+            k_fp8,
+            scale,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            clean_logits=clean_logits,
+        )
     else:
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
@@ -947,12 +1035,18 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seq_lens,
                 token_to_seq=chunk.token_to_seq,
             )
+            # Skip the -inf fill: the only reader of these logits is the top-k
+            # below, and both of its implementations take the same
+            # cu_seqlen_ks/ke and scan only [ks, ke) per row, so the positions
+            # the fill would write are never looked at. See
+            # VLLM_DSV4_INDEXER_LOGITS_INF_FILL for the measurement.
             logits = rocm_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
                 (k_fp8, k_scale.view(torch.float32)),
                 weights[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
+                clean_logits=envs.VLLM_DSV4_INDEXER_LOGITS_INF_FILL,
             )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
@@ -1184,6 +1278,251 @@ def _fused_inverse_rope_gptj(
     return out
 
 
+@functools.cache
+def _inplace_inv_rope_enabled() -> bool:
+    """Escape hatch for the in-place inverse RoPE (VLLM_DSV4_INPLACE_INV_ROPE=0)."""
+    return os.getenv("VLLM_DSV4_INPLACE_INV_ROPE", "1") != "0"
+
+
+@triton.jit
+def _inverse_rope_gptj_inplace_kernel(
+    o_ptr,  # [T, H, D] bf16, rotated in place
+    pos_ptr,  # [T] positions
+    cos_sin_ptr,  # [P, rope_dim] fp32 (cos[:half] | sin[half:])
+    s_t,
+    s_h,  # row strides (last dim contiguous)
+    cs_stride,  # cos_sin_cache row stride
+    num_tokens,
+    num_heads,
+    NOPE: tl.constexpr,  # non-rope head dims, never touched
+    ROPE: tl.constexpr,
+    HALF: tl.constexpr,  # ROPE // 2
+    HEADS_PER_PROG: tl.constexpr,
+):
+    """Inverse GPT-J RoPE over o[:, :, NOPE:], leaving the NoPE lanes alone.
+
+    Same math as ``_inverse_rope_gptj_kernel`` but it neither reads nor writes
+    the 448 pass-through lanes, which is 7/8 of the tensor. One program owns a
+    [HEADS_PER_PROG, ROPE] tile of one token; cos/sin are per-token so they
+    broadcast across the head axis.
+
+    Each lane's pair partner comes out of the tile the program already holds,
+    via reshape to [HEADS, HALF, 2]. Addressing it as ``base + (r ^ 1)``
+    instead costs a second gather over the same bytes, which held the kernel
+    at 2.5 TB/s; one contiguous load plus one contiguous store puts it at
+    5.98 TB/s, i.e. on the measured read-modify-write bound for these lanes
+    (46.9 -> 19.6 us at T=3584, bit-identical output).
+    """
+    # int64 strides: pid(int32) * stride(int32) wraps past 2**31 once
+    # T * H * D crosses ~2G elements, which large prefill chunks do.
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+    s_t = s_t.to(tl.int64)
+    s_h = s_h.to(tl.int64)
+
+    heads = pid_h * HEADS_PER_PROG + tl.arange(0, HEADS_PER_PROG)
+    hmask = (heads < num_heads)[:, None]
+    base = o_ptr + pid_t * s_t + heads[:, None] * s_h + NOPE
+
+    r = tl.arange(0, ROPE)[None, :]
+    x = tl.load(base + r, mask=hmask).to(tl.float32)
+    # Even lanes hold a, odd lanes hold b; take them apart in registers.
+    xp = tl.reshape(x, (HEADS_PER_PROG, HALF, 2))
+    two = tl.arange(0, 2)[None, None, :]
+    a = tl.reshape(tl.sum(tl.where(two == 0, xp, 0.0), axis=2), (HEADS_PER_PROG, HALF))
+    b = tl.reshape(tl.sum(tl.where(two == 1, xp, 0.0), axis=2), (HEADS_PER_PROG, HALF))
+
+    pos = tl.load(pos_ptr + pid_t).to(tl.int64)
+    k = tl.arange(0, HALF)
+    cos = tl.load(cos_sin_ptr + pos * cs_stride + k)
+    sin = tl.load(cos_sin_ptr + pos * cs_stride + HALF + k)
+
+    # out_even = a * cos + b * sin, out_odd = b * cos - a * sin
+    ye = a * cos[None, :] + b * sin[None, :]
+    yo = b * cos[None, :] - a * sin[None, :]
+    rotated = tl.reshape(tl.join(ye, yo), (HEADS_PER_PROG, ROPE))
+    tl.store(base + r, rotated.to(tl.bfloat16), mask=hmask)
+
+
+def _fused_inverse_rope_gptj_inplace(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_head_dim: int,
+) -> torch.Tensor:
+    """In-place bf16 inverse GPT-J RoPE. Returns ``o`` for call-site symmetry."""
+    num_tokens, num_heads, head_dim = o.shape
+    if num_tokens == 0:
+        return o
+    # With the partner coming out of registers the fp32 temporaries are half
+    # what the two-gather form needed, so the tile can go wide: 32 heads
+    # (4 KiB) with 2 warps sits on the bandwidth bound, and 8 heads leaves
+    # ~4 us on the table. Anything under 32 heads still works via hmask.
+    heads_per_prog = min(32, triton.next_power_of_2(num_heads))
+    _inverse_rope_gptj_inplace_kernel[
+        (num_tokens, triton.cdiv(num_heads, heads_per_prog))
+    ](
+        o,
+        positions,
+        cos_sin_cache,
+        o.stride(0),
+        o.stride(1),
+        cos_sin_cache.stride(0),
+        num_tokens,
+        num_heads,
+        NOPE=head_dim - rope_head_dim,
+        ROPE=rope_head_dim,
+        HALF=rope_head_dim // 2,
+        HEADS_PER_PROG=heads_per_prog,
+        num_warps=2,
+    )
+    return o
+
+
+@triton.jit
+def _inverse_rope_gptj_quant_kernel(
+    o_ptr,  # [T, H, D] input
+    out_ptr,  # [T, H, D] fp8 e4m3 output
+    pos_ptr,  # [T] positions
+    cos_sin_ptr,  # [P, rope_dim] fp32 (cos[:half] | sin[half:])
+    s_ptr,  # [T, H * NBLK] uint8 e8m0 scales
+    s_t,
+    s_h,  # input row strides (last dim contiguous)
+    os_t,
+    os_h,  # output row strides
+    cs_stride,  # cos_sin_cache row stride
+    ss_t,  # scale row stride per token
+    num_heads,
+    HEAD_DIM: tl.constexpr,  # full head row, NoPE + rope
+    NOPE: tl.constexpr,  # non-rope head dims (passed through)
+    HALF: tl.constexpr,  # rope_dim // 2
+    HEADS: tl.constexpr,  # heads handled per program
+    NBLK: tl.constexpr,  # 128-wide quant groups per head
+    BLK: tl.constexpr,  # group width, 128
+):
+    """Inverse GPT-J RoPE that emits fp8 e4m3 plus 128-wide e8m0 group scales.
+
+    The quant cannot reuse the in-place kernel: the output dtype differs from
+    the input, so every lane has to be written, including the NoPE lanes the
+    in-place form deliberately leaves alone. It still beats quantizing in a
+    pass of its own, which would read back everything this kernel just wrote.
+
+    The rotation runs at full head width against per-pair cos/sin that are the
+    identity (cos=1, sin=0) on the NoPE pairs. That makes the whole row one
+    unmasked contiguous load and one unmasked contiguous store: addressing the
+    rope lanes separately costs two stride-2 gathers plus two stride-2
+    scatters over bytes the row load already covers. With that and the group
+    scaling done as a multiply by the exact reciprocal 2^(127-e) rather than a
+    per-element divide, the kernel runs at 5.9 TB/s, which is the measured
+    bf16 -> fp8 conversion bound for this tensor (153.6 -> 119.9 us at
+    T=3584, versus a 119.0 us floor for a plain cast, bit-identical output).
+    """
+    pid_h = tl.program_id(0).to(tl.int64)
+    t = tl.program_id(1).to(tl.int64)
+    s_t = s_t.to(tl.int64)
+    os_t = os_t.to(tl.int64)
+
+    hs = pid_h * HEADS + tl.arange(0, HEADS)
+    hmask = (hs < num_heads)[:, None]
+
+    d = tl.arange(0, HEAD_DIM)[None, :]
+    x = tl.load(o_ptr + t * s_t + hs[:, None] * s_h + d, mask=hmask).to(tl.float32)
+
+    # Per-pair rotation across the whole row. The NoPE pairs load cos=1/sin=0
+    # and come out unchanged, so no lane needs separate addressing.
+    # out_even = a*cos + b*sin, out_odd = b*cos - a*sin
+    # (a = even lane, b = odd lane; sin negated for the inverse rotation).
+    PAIRS: tl.constexpr = HEAD_DIM // 2
+    p = tl.arange(0, PAIRS)
+    is_rope = p >= (NOPE // 2)
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+    cs = cos_sin_ptr + pos * cs_stride + (p - NOPE // 2)
+    cos = tl.load(cs, mask=is_rope, other=1.0)
+    sin = tl.load(cs + HALF, mask=is_rope, other=0.0)
+
+    xp = tl.reshape(x, (HEADS, PAIRS, 2))
+    two = tl.arange(0, 2)[None, None, :]
+    a = tl.reshape(tl.sum(tl.where(two == 0, xp, 0.0), axis=2), (HEADS, PAIRS))
+    b = tl.reshape(tl.sum(tl.where(two == 1, xp, 0.0), axis=2), (HEADS, PAIRS))
+    y = tl.reshape(
+        tl.join(a * cos[None, :] + b * sin[None, :],
+                b * cos[None, :] - a * sin[None, :]),
+        (HEADS, HEAD_DIM),
+    )
+
+    # Group maxima over the physical 128-wide blocks of the rotated row.
+    grouped = tl.reshape(y, (HEADS, NBLK, BLK))
+    amax = tl.max(tl.abs(grouped), axis=2)
+    raw = tl.maximum(amax / 448.0, 1e-8)
+    e = tl.minimum(tl.maximum(tl.ceil(tl.log2(raw)).to(tl.int32) + 127, 0), 255)
+
+    # 2^(127-e) is exact, so the multiply is bit-identical to dividing by the
+    # scale and drops a per-element divide out of a bandwidth-bound kernel.
+    q = tl.reshape(grouped * tl.exp2((127 - e).to(tl.float32))[:, :, None],
+                   (HEADS, HEAD_DIM))
+    q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+    tl.store(out_ptr + t * os_t + hs[:, None] * os_h + d,
+             q.to(out_ptr.dtype.element_ty), mask=hmask)
+
+    s_off = t * ss_t + hs[:, None] * NBLK + tl.arange(0, NBLK)[None, :]
+    tl.store(s_ptr + s_off, e.to(tl.uint8), mask=hmask)
+
+
+def _fused_inverse_rope_gptj_quant(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse GPT-J RoPE emitting fp8 e4m3 values and uint8 e8m0 scales."""
+    num_tokens, num_heads, head_dim = o.shape
+    nope = head_dim - rope_head_dim
+    nblk = head_dim // 128
+    # The row is loaded and rotated at full width, so head_dim has to be a
+    # power of two, and the rope lanes have to be the trailing lanes of an
+    # even-indexed pair so the identity cos/sin trick lines up.
+    assert (
+        head_dim % 128 == 0
+        and triton.next_power_of_2(head_dim) == head_dim
+        and nope % 2 == 0
+    ), f"cannot fold the quant into the rope for head_dim={head_dim}"
+    out = torch.empty(
+        (num_tokens, num_heads, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device=o.device,
+    )
+    scales = torch.empty(
+        (num_tokens, num_heads * nblk), dtype=torch.uint8, device=o.device
+    )
+    if num_tokens == 0:
+        return out, scales
+    heads_per_prog = min(16, triton.next_power_of_2(num_heads))
+    _inverse_rope_gptj_quant_kernel[
+        (triton.cdiv(num_heads, heads_per_prog), num_tokens)
+    ](
+        o,
+        out,
+        positions,
+        cos_sin_cache,
+        scales,
+        o.stride(0),
+        o.stride(1),
+        out.stride(0),
+        out.stride(1),
+        cos_sin_cache.stride(0),
+        num_heads * nblk,
+        num_heads,
+        HEAD_DIM=head_dim,
+        NOPE=nope,
+        HALF=rope_head_dim // 2,
+        HEADS=heads_per_prog,
+        NBLK=nblk,
+        BLK=128,
+        num_warps=4,
+    )
+    return out, scales
+
+
 def _get_cached_wo_a_bf16(
     wo_a: torch.nn.Module,
     n_local_groups: int,
@@ -1234,10 +1573,50 @@ def rocm_inv_rope_einsum(
 
     Fuses the inverse GPT-J RoPE into one Triton kernel and caches the bf16
     wo_a weight so the per-step dequant disappears.
+
+    The RoPE runs in place on ``o`` when it can: inverse RoPE only rewrites the
+    trailing rope_head_dim of each head, so the out-of-place kernel spends 7/8
+    of its traffic copying NoPE lanes it does not modify, and it allocates a
+    second [T, H, D] bf16 tensor (384 MiB at M=3072) to hold them. ``o`` is the
+    attention output buffer and this is its last reader, so overwriting the 64
+    rope lanes is safe. Measured at M=3072: 410 us -> 41 us.
+
+    Under VLLM_DSV4_FP8_BMM the bmm runs in fp8 off the checkpoint's own e8m0
+    scales instead of a cached bf16 dequant. That path cannot use the in-place
+    RoPE -- it has to write every lane because the output dtype changes -- so
+    it trades a wider RoPE write for halving both the bmm's input traffic and
+    its math.
     """
-    o_ref = _fused_inverse_rope_gptj(
-        o, positions, rotary_emb.cos_sin_cache, rope_head_dim
+    if envs.VLLM_DSV4_FP8_BMM and getattr(wo_a, "weight_bmm", None) is not None:
+        from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+
+        fused_q, fused_s = _fused_inverse_rope_gptj_quant(
+            o, positions, rotary_emb.cos_sin_cache, rope_head_dim
+        )
+        # The tuned CSV is read in batched_gemm_a8w8_mxscale, not in the raw
+        # opus entry -- calling bmm_a8w8_mxscale_opus directly falls back to the
+        # shape heuristic and leaves the tuned rows for this shape unused.
+        return batched_gemm_a8w8_mxscale(
+            fused_q.view(o.shape[0], n_local_groups, -1),
+            wo_a.weight_bmm,
+            fused_s.view(o.shape[0], n_local_groups, -1),
+            wo_a.weight_scale_e8m0_bmm,
+        )
+
+    # o.view() below needs full contiguity, and tl.arange needs a power-of-2 rope.
+    can_run_inplace = (
+        _inplace_inv_rope_enabled()
+        and o.is_contiguous()
+        and rope_head_dim == triton.next_power_of_2(rope_head_dim)
     )
+    if can_run_inplace:
+        o_ref = _fused_inverse_rope_gptj_inplace(
+            o, positions, rotary_emb.cos_sin_cache, rope_head_dim
+        )
+    else:
+        o_ref = _fused_inverse_rope_gptj(
+            o, positions, rotary_emb.cos_sin_cache, rope_head_dim
+        )
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
     wo_a_weight = _get_cached_wo_a_bf16(
@@ -3203,6 +3582,11 @@ def rocm_sparse_attn_decode(
         rope_head_dim,
         "rocm_sparse_attn_decode",
     )
+
+    # Nothing to attend to: launching the kernels on empty inputs would build
+    # degenerate grids over a zero-length index buffer.
+    if q.shape[0] == 0 or swa_indices.numel() == 0:
+        return
 
     main_indices = swa_indices.reshape(swa_indices.shape[0], -1)
 

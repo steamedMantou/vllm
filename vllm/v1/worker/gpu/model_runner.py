@@ -72,6 +72,10 @@ from vllm.v1.outputs import (
     RoutedExpertsTensors,
 )
 from vllm.v1.worker.block_table import get_block_table_width
+from vllm.v1.attention.ops.pcp import (
+    begin_pcp_comm_gpu_timing,
+    end_pcp_comm_gpu_timing,
+)
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
@@ -1743,19 +1747,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                pcp_gathered_is_padding=input_batch.pcp_gathered_is_padding,
+                pcp_c128_boundary_indices=input_batch.pcp_c128_boundary_indices,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                begin_pcp_comm_gpu_timing()
+                try:
+                    if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+                        # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                        # PIECEWISE after the cudagraph manager exists.
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
+                    else:
+                        # Eager (NONE): call the raw model directly.
+                        model_output = self.model(**model_inputs)
+                finally:
+                    end_pcp_comm_gpu_timing()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

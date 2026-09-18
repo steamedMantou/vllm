@@ -32,6 +32,7 @@ if current_platform.is_rocm():
 else:
     _ON_GFX950 = False
 
+from .cache_utils import flat_token_exponent
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
 
@@ -67,7 +68,10 @@ def compress_norm_rope_store_triton(
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
-        kernel_kwargs = {"SANITIZE_CACHE_NANS": _ON_GFX950}
+        kernel_kwargs = {
+            "SANITIZE_CACHE_NANS": _ON_GFX950,
+            "FLAT_EXP": flat_token_exponent(),
+        }
     elif use_fp4_cache:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
         num_warps = 1
@@ -156,6 +160,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FLAT_EXP: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -259,6 +264,14 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
 
     raw_scales = block_absmax * INV_FP8_MAX
     exponents = tl.ceil(tl.log2(raw_scales))
+    if FLAT_EXP:
+        # One exponent per token, so the prefill kernel can skip aligning them
+        # in LDS.  Only the NoPE blocks take part: block N_NOPE_BLOCKS onward
+        # covers the RoPE tail, which is stored bf16 and never quantised.
+        nope_block = tl.arange(0, N_QUANT_BLOCKS) < N_NOPE_BLOCKS
+        exponents = tl.where(
+            nope_block, tl.max(tl.where(nope_block, exponents, -128.0)), exponents
+        )
     inv_scales = tl.exp2(-exponents)
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
@@ -357,11 +370,13 @@ def _compress_gather_split_sparse_attn(
     block_size,
     scratch_ptr,
     scratch_stride,
+    boundary_indices_ptr,
     HEAD_SIZE: tl.constexpr,
     STATE_WIDTH: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     HEAD_TILE: tl.constexpr,  # HEAD_SIZE // NUM_SPLITS
+    USE_BOUNDARY_INDICES: tl.constexpr,
 ):
     """Stage 1: per-(token, head-split) compress gather, write to fp32 scratch
 
@@ -369,13 +384,15 @@ def _compress_gather_split_sparse_attn(
     """
     pid = tl.program_id(0)
     token_idx = pid // NUM_SPLITS
+    if USE_BOUNDARY_INDICES:
+        token_idx = tl.load(boundary_indices_ptr + token_idx)
     split_idx = pid % NUM_SPLITS
 
     slot_id = tl.load(slot_mapping_ptr + token_idx)
     if slot_id < 0:
         return
     position = tl.load(positions_ptr + token_idx)
-    if (position + 1) % COMPRESS_RATIO != 0:
+    if not USE_BOUNDARY_INDICES and (position + 1) % COMPRESS_RATIO != 0:
         return
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
 
@@ -413,6 +430,7 @@ def _compress_gather_split_sparse_attn(
 def _finalize_norm_rope_quant_store_sparse_attn(
     scratch_ptr,
     scratch_stride,
+    boundary_indices_ptr,
     positions_ptr,
     slot_mapping_ptr,
     rms_norm_weight_ptr,
@@ -432,16 +450,20 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FLAT_EXP: tl.constexpr = False,
+    USE_BOUNDARY_INDICES: tl.constexpr = False,
 ):
     """Stage 2: read compressed_kv[512] from scratch buffer, then
     RMSNorm + FP8 quant (nope) + RoPE + bf16 store
     """
     token_idx = tl.program_id(0)
+    if USE_BOUNDARY_INDICES:
+        token_idx = tl.load(boundary_indices_ptr + token_idx)
     slot_id = tl.load(slot_mapping_ptr + token_idx)
     if slot_id < 0:
         return
     position = tl.load(positions_ptr + token_idx)
-    if (position + 1) % COMPRESS_RATIO != 0:
+    if not USE_BOUNDARY_INDICES and (position + 1) % COMPRESS_RATIO != 0:
         return
 
     block = tl.arange(0, TRITON_BLOCK_SIZE)
@@ -479,6 +501,14 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     block_absmax = tl.maximum(tl.max(tl.abs(quant_2d), axis=1), 1e-4)
     raw_scales = block_absmax * INV_FP8_MAX
     exponents = tl.ceil(tl.log2(raw_scales))
+    if FLAT_EXP:
+        # One exponent per token, so the prefill kernel can skip aligning them
+        # in LDS.  Only the NoPE blocks take part: block N_NOPE_BLOCKS onward
+        # covers the RoPE tail, which is stored bf16 and never quantised.
+        nope_block = tl.arange(0, N_QUANT_BLOCKS) < N_NOPE_BLOCKS
+        exponents = tl.where(
+            nope_block, tl.max(tl.where(nope_block, exponents, -128.0)), exponents
+        )
     inv_scales = tl.exp2(-exponents)
     x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
@@ -539,11 +569,21 @@ def _launch_two_stage_sparse_attn_compressor(
     rope_head_dim: int,
     num_actual: int,
     compress_scratch: torch.Tensor,
+    boundary_indices: torch.Tensor | None = None,
 ) -> None:
     num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
     head_tile = head_dim // num_splits
     scratch = compress_scratch[:num_actual]
-    _compress_gather_split_sparse_attn[(num_actual * num_splits,)](
+    use_boundary_indices = boundary_indices is not None
+    launch_tokens = (
+        boundary_indices.numel() if boundary_indices is not None else num_actual
+    )
+    if launch_tokens == 0:
+        return
+    # Triton still needs a pointer argument in the non-compact specialization;
+    # positions is an unused, valid int64 stand-in in that case.
+    indices = boundary_indices if boundary_indices is not None else positions
+    _compress_gather_split_sparse_attn[(launch_tokens * num_splits,)](
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
@@ -555,15 +595,18 @@ def _launch_two_stage_sparse_attn_compressor(
         block_size,
         scratch,
         scratch.stride(0),
+        indices,
         HEAD_SIZE=head_dim,
         STATE_WIDTH=state_width,
         COMPRESS_RATIO=compress_ratio,
         NUM_SPLITS=num_splits,
         HEAD_TILE=head_tile,
+        USE_BOUNDARY_INDICES=use_boundary_indices,
     )
-    _finalize_norm_rope_quant_store_sparse_attn[(num_actual,)](
+    _finalize_norm_rope_quant_store_sparse_attn[(launch_tokens,)](
         scratch,
         scratch.stride(0),
+        indices,
         positions,
         slot_mapping,
         rms_norm_weight,
@@ -583,6 +626,8 @@ def _launch_two_stage_sparse_attn_compressor(
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         SANITIZE_CACHE_NANS=_ON_GFX950,
+        FLAT_EXP=flat_token_exponent(),
+        USE_BOUNDARY_INDICES=use_boundary_indices,
     )
 
 
@@ -611,6 +656,7 @@ def compress_norm_rope_store_two_stage_triton(
     scale_dim: int,
     num_decode_tokens: int,
     compress_scratch: torch.Tensor,
+    boundary_indices: torch.Tensor | None = None,
 ) -> None:
     """Two-stage split compressor dispatch for head=512 cr>=128 (no-overlap)
 
@@ -620,6 +666,10 @@ def compress_norm_rope_store_two_stage_triton(
     """
     num_decodes = min(max(num_decode_tokens, 0), num_actual)
     num_prefills = num_actual - num_decodes
+    if boundary_indices is not None:
+        assert num_decodes == 0, (
+            "C128 compact indices are only valid for a pure prefill gather"
+        )
     if num_prefills > 0:
         _launch_two_stage_sparse_attn_compressor(
             state_cache=state_cache,
@@ -642,6 +692,7 @@ def compress_norm_rope_store_two_stage_triton(
             rope_head_dim=rope_head_dim,
             num_actual=num_prefills,
             compress_scratch=compress_scratch,
+            boundary_indices=boundary_indices,
         )
     if num_decodes > 0:
         compress_norm_rope_store_triton(

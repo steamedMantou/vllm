@@ -226,12 +226,18 @@ class SiluAndMulWithClamp(CustomOp):
         self.swiglu_limit = float(swiglu_limit)
         self.alpha = float(alpha)
         self.beta = float(beta)
-        if current_platform.is_rocm() or current_platform.is_xpu():
+        # ROCm satisfies is_cuda_alike() and the HIP build carries the kernel,
+        # so it takes the fused path as well. It used to be sent to
+        # forward_native, whose six elementwise launches cost 82.4 us per layer
+        # against the fused kernel's 15.6 us at DeepSeek-V4's shared expert
+        # shape (M=3584, d=3072) -- 16.3 ms per 100k prefill. Guarded because
+        # not every ROCm build compiles the op; XPU and CPU have no kernel.
+        if current_platform.is_xpu() or current_platform.is_cpu():
             self._forward_method = self.forward_native
         elif current_platform.is_cuda_alike():
-            self.op = torch.ops._C.silu_and_mul_with_clamp
-        elif current_platform.is_cpu():
-            self._forward_method = self.forward_native
+            self.op = getattr(torch.ops._C, "silu_and_mul_with_clamp", None)
+            if self.op is None:
+                self._forward_method = self.forward_native
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -245,6 +251,11 @@ class SiluAndMulWithClamp(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
         return out
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # CustomOp.forward_hip defaults to forward_native, which would undo the
+        # dispatch above.
+        return self.forward_cuda(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)

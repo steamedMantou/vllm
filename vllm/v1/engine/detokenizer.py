@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import sys
 from abc import ABC, abstractmethod
 
@@ -26,6 +27,17 @@ USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0
 
 # Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
 INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
+
+# How many trailing prompt tokens to prime DecodeStream with. The primed ids
+# only fix the boundary for the first generated token -- output_text starts
+# empty and stop strings match generated text alone -- so a tail is enough, and
+# the slow detokenizer already relies on that, priming from just the last
+# INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET + 2 (7) ids. Priming with the whole
+# prompt is not free: DecodeStream decodes the full id list on its first step to
+# establish a baseline, which lands on the token TTFT measures (24 ms at a
+# 102400-token prompt). Set VLLM_DETOK_PRIME_TAIL=0 to prime with the whole
+# prompt again.
+_PRIME_TAIL_TOKENS = int(os.environ.get("VLLM_DETOK_PRIME_TAIL", "32"))
 
 
 class IncrementalDetokenizer:
@@ -181,8 +193,11 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         # Look up DecodeStream on the module so backend patches (e.g. the
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
+        prime_ids = request.prompt_token_ids
+        if prime_ids and 0 < _PRIME_TAIL_TOKENS < len(prime_ids):
+            prime_ids = prime_ids[-_PRIME_TAIL_TOKENS:]
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=prime_ids,
             skip_special_tokens=self.skip_special_tokens,
         )
 

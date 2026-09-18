@@ -14,6 +14,7 @@ preparation.
   window indices for sparse prefill.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,271 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import next_power_of_2
+
+
+@triton.jit
+def _rope_kv_kernel(
+    kv_ptr,
+    kv_out_ptr,
+    position_ids_ptr,
+    cos_sin_cache_ptr,
+    num_tokens,
+    head_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    if token_idx >= num_tokens:
+        return
+
+    nope_dim: tl.constexpr = head_dim - rope_dim
+    half_rope: tl.constexpr = rope_dim // 2
+    kv_base = kv_ptr + token_idx * head_dim
+    out_base = kv_out_ptr + token_idx * head_dim
+
+    offsets = tl.arange(0, head_dim)
+    tl.store(out_base + offsets, tl.load(kv_base + offsets))
+
+    pair = tl.arange(0, half_rope)
+    even = nope_dim + pair * 2
+    odd = even + 1
+    position = tl.load(position_ids_ptr + token_idx).to(tl.int64)
+    cos = tl.load(cos_sin_cache_ptr + position * rope_dim + pair).to(tl.float32)
+    sin = tl.load(cos_sin_cache_ptr + position * rope_dim + half_rope + pair).to(
+        tl.float32
+    )
+    x_even = tl.load(kv_base + even).to(tl.float32)
+    x_odd = tl.load(kv_base + odd).to(tl.float32)
+    tl.store(out_base + even, x_even * cos - x_odd * sin)
+    tl.store(out_base + odd, x_even * sin + x_odd * cos)
+
+
+def _fused_rope_insert() -> bool:
+    """Escape hatch for the fused RoPE+quantise+insert (VLLM_DSV4_FUSED_ROPE_INSERT=0)."""
+    return os.getenv("VLLM_DSV4_FUSED_ROPE_INSERT", "1") != "0"
+
+
+def flat_token_exponent() -> bool:
+    """One UE8M0 exponent per token instead of one per 64-element block.
+
+    The ASM prefill kernel aligns every block-64 exponent to its token's inside
+    LDS, once per gather rather than once per row -- O(N*topk), and 38.5% of the
+    kernel's dynamic VALU.  Writing the cache already flat lets that pass be
+    dropped; aiter's .co then has to be the requant-skipping build, so this must
+    be turned on together with it (launch_service/mla_isa).
+
+    Readers need no change: they index ``scale[dim // 64]`` and all seven bytes
+    hold the same value.  Neither does precision -- e4m3 carries its own 4-bit
+    exponent, so re-expressing a block at a coarser power of two moves it inside
+    that range instead of spending mantissa.  Measured over 42.3M real block-64s
+    the relative error is identical at every octave of gap.
+    """
+    return os.getenv("VLLM_DSV4_KV_FLAT_EXP", "0") != "0"
+
+
+@triton.jit
+def _rope_quantize_and_insert_k_kernel(
+    kv_ptr,  # [num_tokens, 512] bf16, pre-RoPE
+    position_ids_ptr,  # [num_tokens]
+    cos_sin_cache_ptr,
+    slot_mapping_ptr,  # [num_tokens] int64
+    k_cache_ptr,  # [num_blocks, block_bytes] as uint8 (flattened view)
+    num_tokens,
+    input_dim: tl.constexpr,  # 512
+    fp8_dim: tl.constexpr,  # 448
+    rope_dim: tl.constexpr,  # 64
+    scale_dim: tl.constexpr,  # 8
+    quant_block: tl.constexpr,  # 64
+    cache_block_size: tl.constexpr,  # 64
+    token_data_size: tl.constexpr,  # 576 bytes per token data
+    block_stride: tl.constexpr,  # total bytes per block (padded)
+    fp8_max: tl.constexpr,
+    n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+    use_fnuz: tl.constexpr = False,
+    flat_exp: tl.constexpr = False,
+):
+    """RoPE, UE8M0 quantise and paged insert for one token, in one pass.
+
+    Doing the RoPE in its own kernel costs a full [T, 512] bf16 round trip
+    through HBM for the intermediate -- 29 MB written and read back per layer
+    per step at the PCP prefill shape, for a kernel pair that only has to move
+    46 MB in total.  RoPE touches nothing but the last ``rope_dim`` dims, which
+    are exactly the cache's bf16 tail, so the fp8 body can be quantised
+    straight from the input and the two halves never have to meet.
+
+    The quantisation is one [n_quant_blocks, quant_block] tile rather than a
+    static_range over one 64-wide block at a time: the eight amax reductions
+    then issue together and the 448 fp8 bytes leave in a single store, instead
+    of eight dependent 64-byte ones.  Same for the tail, which was going out in
+    four 32-byte pieces.
+    """
+    pid = tl.program_id(0)
+
+    if pid >= num_tokens:
+        return
+
+    slot_idx = tl.load(slot_mapping_ptr + pid)
+    if slot_idx == -1:
+        return
+
+    block_idx = slot_idx // cache_block_size
+    pos_in_block = slot_idx % cache_block_size
+
+    input_row_ptr = kv_ptr + pid * input_dim
+
+    # int64: block_idx * block_stride can exceed 2^31 with many KV-cache blocks
+    # (e.g. >= 57K at block_stride ~37K). Matches quantize_and_insert_k_kernel.
+    cache_block_ptr = k_cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+    token_scale_ptr = (
+        cache_block_ptr + cache_block_size * token_data_size + pos_in_block * scale_dim
+    )
+
+    # ===== fp8 body: dims [0, fp8_dim), which RoPE does not touch =====
+    rows = tl.arange(0, n_quant_blocks)
+    cols = tl.arange(0, quant_block)
+    offsets = rows[:, None] * quant_block + cols[None, :]
+    mask = offsets < fp8_dim
+
+    x = tl.load(input_row_ptr + offsets, mask=mask, other=0.0)
+
+    block_max = tl.max(tl.abs(x), axis=1)
+    block_max = tl.maximum(block_max, 1e-4)  # match CUDA: fmaxf(amax, 1e-4)
+
+    # UE8M0: round the scale up to the next power of two.
+    exponent = tl.ceil(tl.log2(block_max / fp8_max))
+    real_rows = rows < (fp8_dim // quant_block)
+    if flat_exp:
+        # Collapse to one exponent per token.  The padding row is masked out of
+        # the reduction rather than left to the 1e-4 clamp: that clamp does make
+        # it very negative today, but nothing states it has to.
+        exponent = tl.where(
+            real_rows, tl.max(tl.where(real_rows, exponent, -128.0)), exponent
+        )
+    scale = tl.exp2(exponent)
+
+    x_clamped = tl.clamp(x / scale[:, None], -fp8_max, fp8_max)
+    if use_fnuz:
+        x_fp8 = x_clamped.to(tl.float8e4b8)
+    else:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+    tl.store(token_data_ptr + offsets, x_fp8.to(tl.uint8, bitcast=True), mask=mask)
+
+    # Stored scale is exponent + 127; the trailing slot is padding and stays 0.
+    encoded_scale = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0)
+    encoded_scale = tl.where(real_rows, encoded_scale, 0.0)
+    tl.store(token_scale_ptr + rows, encoded_scale.to(tl.uint8))
+
+    # ===== bf16 tail: dims [fp8_dim, input_dim), GPT-J RoPE =====
+    half_rope: tl.constexpr = rope_dim // 2
+    pair = tl.arange(0, half_rope)
+    even = fp8_dim + pair * 2
+    odd = even + 1
+
+    position = tl.load(position_ids_ptr + pid).to(tl.int64)
+    cos = tl.load(cos_sin_cache_ptr + position * rope_dim + pair).to(tl.float32)
+    sin = tl.load(cos_sin_cache_ptr + position * rope_dim + half_rope + pair).to(
+        tl.float32
+    )
+    x_even = tl.load(input_row_ptr + even).to(tl.float32)
+    x_odd = tl.load(input_row_ptr + odd).to(tl.float32)
+
+    bf16_out_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+    tl.store(bf16_out_ptr + pair * 2, (x_even * cos - x_odd * sin).to(tl.bfloat16))
+    tl.store(bf16_out_ptr + pair * 2 + 1, (x_even * sin + x_odd * cos).to(tl.bfloat16))
+
+
+def _rope_quantize_and_insert_k_cache(
+    kv: torch.Tensor,  # [num_tokens, 512] bf16, pre-RoPE
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    rope_dim: int,
+    use_fnuz: bool = False,
+) -> None:
+    """Fused form of _rope_kv_kernel followed by quantize_and_insert_k_cache."""
+    assert kv.dim() == 2 and kv.shape[1] == 512, (
+        f"KV must be [num_tokens, 512], got {kv.shape}"
+    )
+    assert kv.dtype == torch.bfloat16, f"KV must be bf16, got {kv.dtype}"
+
+    # Matches quantize_and_insert_k_cache: under DP slot_mapping can be shorter
+    # than kv, and it is the count that decides how many rows get written.
+    num_tokens = slot_mapping.shape[0]
+
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    if use_fnuz:
+        if not current_platform.is_fp8_fnuz():
+            raise ValueError("use_fnuz=True requires a platform using FNUZ FP8")
+        _, FP8_MAX = get_fp8_min_max()
+    else:
+        FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+    _rope_quantize_and_insert_k_kernel[(num_tokens,)](
+        kv,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        k_cache,
+        num_tokens,
+        input_dim=512,
+        fp8_dim=TOKEN_FP8_DIM,
+        rope_dim=rope_dim,
+        scale_dim=TOKEN_SCALE_DIM,
+        quant_block=QUANT_BLOCK_SIZE,
+        cache_block_size=block_size,
+        token_data_size=TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2,
+        block_stride=k_cache.stride(0),
+        fp8_max=FP8_MAX,
+        n_quant_blocks=8,
+        use_fnuz=use_fnuz,
+        flat_exp=flat_token_exponent(),
+    )
+
+
+def rope_and_insert_k_cache(
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    rope_dim: int,
+) -> None:
+    """Apply GPT-J RoPE and insert already-normalized DSV4 KV rows."""
+    if _fused_rope_insert():
+        _rope_quantize_and_insert_k_cache(
+            kv,
+            positions,
+            cos_sin_cache,
+            k_cache.view(k_cache.shape[0], -1),
+            slot_mapping,
+            block_size=block_size,
+            rope_dim=rope_dim,
+        )
+        return
+
+    num_tokens, head_dim = kv.shape
+    kv_roped = torch.empty_like(kv)
+    _rope_kv_kernel[(num_tokens,)](
+        kv,
+        kv_roped,
+        positions,
+        cos_sin_cache,
+        num_tokens,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+    )
+    quantize_and_insert_k_cache(
+        kv_roped,
+        k_cache.view(k_cache.shape[0], -1),
+        slot_mapping,
+        block_size=block_size,
+    )
 
 
 @triton.jit
@@ -53,6 +319,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    flat_exp: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -101,6 +368,27 @@ def quantize_and_insert_k_kernel(
     token_fp8_ptr = token_data_ptr
     token_bf16_ptr = token_data_ptr + fp8_dim
 
+    # One exponent per token needs its own pass over all 448 dims first: the
+    # loop below sees a single 64-block at a time.  tl.arange wants a power of
+    # two, so it spans input_dim and masks the RoPE tail off.
+    token_exponent = 0.0
+    if flat_exp:
+        flat_offsets = tl.arange(0, input_dim)
+        token_absmax = tl.maximum(
+            tl.max(
+                tl.abs(
+                    tl.load(
+                        input_row_ptr + flat_offsets,
+                        mask=flat_offsets < fp8_dim,
+                        other=0.0,
+                    )
+                ),
+                axis=0,
+            ),
+            1e-4,
+        )
+        token_exponent = tl.ceil(tl.log2(token_absmax / fp8_max))
+
     # ========== Quantize and store FP8 portion (first 448 elements) ==========
     # Using UE8M0 quantization strategy (scale is power of 2, stored as uint8 exponent)
     for qblock_idx in tl.static_range(n_quant_blocks):
@@ -123,6 +411,8 @@ def quantize_and_insert_k_kernel(
             raw_scale = block_max / fp8_max
             log_scale = tl.log2(raw_scale)
             exponent = tl.ceil(log_scale)  # Round UP to next integer exponent
+            if flat_exp:
+                exponent = token_exponent
             scale = tl.exp2(exponent)  # scale = 2^exponent (power of 2)
 
             # Quantize to fp8: fp8_value = bf16_value / scale
@@ -222,6 +512,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        flat_exp=flat_token_exponent(),
     )
 
 

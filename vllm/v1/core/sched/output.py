@@ -266,10 +266,12 @@ class SchedulerOutput:
     ec_connector_metadata: ECConnectorMetadata | None = None
     # EC Cache Manager metadata
     ec_manager_metadata: EncoderCacheManagerMetadata | None = None
-    # Block IDs freshly allocated from the pool during this scheduling step.
-    # The worker zeros the corresponding GPU memory before the blocks are used,
-    # preventing stale NaN/data from corrupting attention or SSM computation.
-    new_block_ids_to_zero: list[int] | None = None
+    # Block IDs freshly allocated from the pool during this scheduling step,
+    # indexed by kv_cache_group_id. The worker zeros the corresponding GPU
+    # memory before the blocks are used, preventing stale NaN/data from
+    # corrupting attention or SSM computation. Blocks are grouped because a
+    # block ID only addresses the layers of the group that allocated it.
+    new_block_ids_to_zero: list[list[int]] | None = None
 
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None

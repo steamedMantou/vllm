@@ -155,6 +155,31 @@ class ForwardContext:
     # the producer does not set it.
     is_padding: torch.Tensor | None = None
 
+    # PCP's rank-major version of ``is_padding``. It is made while the PCP
+    # batch layout is built, so MoE can reuse it instead of all-gathering the
+    # same boolean mask in every layer.
+    pcp_gathered_is_padding: torch.Tensor | None = None
+
+    # C128 compression-boundary rows in rank-major gathered prefill order.
+    # Present only for the compact two-stage C128 fast path.
+    pcp_c128_boundary_indices: torch.Tensor | None = None
+
+    # MXFP8 group-32 e8m0 scales for the MoE expert input, set when the PCP
+    # all-gather carried the input pre-quantized. The gather happens in the MoE
+    # runner but the scales are needed by the experts kernel further down, and
+    # the layers in between have no channel for them. None when the gather
+    # carried bf16, which is every path except the AITER MXFP8 one.
+    pcp_moe_a1q_scale: torch.Tensor | None = None
+
+    # Gathered PCP cache descriptors, keyed by the metadata object they came
+    # from. Every layer in an attention group is handed the same metadata
+    # object, so the positions / slot mapping / token-to-request map they gather
+    # is bit-identical across all 61 of them. Caching here rather than on the
+    # metadata gives the entry the lifetime of one forward pass, which is what
+    # bounds its validity: the builders write those maps into preallocated
+    # buffers and overwrite them in place on the next step.
+    pcp_descriptor_cache: dict[int, Any] = field(default_factory=dict)
+
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
 
@@ -220,6 +245,8 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    pcp_gathered_is_padding: torch.Tensor | None = None,
+    pcp_c128_boundary_indices: torch.Tensor | None = None,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -238,6 +265,8 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        pcp_gathered_is_padding=pcp_gathered_is_padding,
+        pcp_c128_boundary_indices=pcp_c128_boundary_indices,
     )
 
 
@@ -268,6 +297,8 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    pcp_gathered_is_padding: torch.Tensor | None = None,
+    pcp_c128_boundary_indices: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -337,6 +368,8 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        pcp_gathered_is_padding=pcp_gathered_is_padding,
+        pcp_c128_boundary_indices=pcp_c128_boundary_indices,
     )
 
     try:

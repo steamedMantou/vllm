@@ -1476,7 +1476,24 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = torch.empty_like(hidden_states)
+        # Usually the input is unquantized and its dtype is the layer's
+        # activation dtype, but a dispatch that quantizes to save bandwidth
+        # hands us the quantized tensor directly. The layer still produces
+        # activations, so take the dtype from the config rather than the input.
+        in_dtype = hidden_states.dtype
+        out_shape = hidden_states.shape
+        if in_dtype.is_floating_point and in_dtype.itemsize == 1:
+            in_dtype = self.fused_experts.moe_config.in_dtype
+        # The same reasoning applies to the width, and for MXFP4 it bites:
+        # fp4x2 packs two values per byte, so a dispatch that quantized to
+        # MXFP4 hands us a tensor half the hidden dim wide. MXFP8 does not,
+        # which is why taking the shape verbatim was correct until now. The
+        # layer's output is unpacked activations at the full width either way.
+        if hidden_states.dtype == getattr(torch, "float4_e2m1fn_x2", None):
+            out_shape = (*out_shape[:-1], out_shape[-1] * 2)
+        output = torch.empty(
+            out_shape, dtype=in_dtype, device=hidden_states.device
+        )
 
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:
@@ -1499,7 +1516,7 @@ class FusedMoEKernelModularImpl:
             lora_ctx.original_hidden_states = hidden_states
 
         fused_out = self._fused_experts(
-            in_dtype=hidden_states.dtype,
+            in_dtype=in_dtype,
             a1q=a1q,
             a1q_scale=a1q_scale,
             w1=w1,

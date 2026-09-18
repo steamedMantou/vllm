@@ -154,6 +154,10 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.attention.ops.pcp import (
+    begin_pcp_comm_gpu_timing,
+    end_pcp_comm_gpu_timing,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -1147,10 +1151,10 @@ class GPUModelRunner(
             static_forward_context=self.compilation_config.static_forward_context,
         )
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
-        """Zero the KV cache memory for the given block IDs."""
+    def _zero_block_ids(self, block_ids_by_group: list[list[int]]) -> None:
+        """Zero the KV cache memory for each group's newly allocated blocks."""
         if hasattr(self, "_kv_block_zeroer"):
-            self._kv_block_zeroer.zero_block_ids(block_ids)
+            self._kv_block_zeroer.zero_block_ids(block_ids_by_group)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -4501,13 +4505,17 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            begin_pcp_comm_gpu_timing()
+            try:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                end_pcp_comm_gpu_timing()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
