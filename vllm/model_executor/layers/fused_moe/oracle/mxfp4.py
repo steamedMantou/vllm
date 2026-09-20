@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Literal, Union
 
 import torch
 
+import vllm.envs as envs
+
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
 from vllm.config import get_current_vllm_config
@@ -1908,6 +1910,39 @@ def make_mxfp4_moe_kernel(
 ) -> mk.FusedMoEKernel:
     """Create a FusedMoEKernel for the given MXFP4 backend."""
     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
+    mxfp_dispatch_dtype: torch.dtype | None = None
+    if (
+        not is_monolithic
+        and envs.VLLM_ROCM_ALL2ALL_PREQUANT
+        and mxfp4_backend
+        in (
+            Mxfp4MoeBackend.AITER_MXFP4_FP8,
+            Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+        )
+    ):
+        from aiter import dtypes
+
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            raise NotImplementedError("AITER MXFP4/MXFP8 dispatch requires gfx950")
+        if moe_config.hidden_dim % 32 != 0:
+            raise ValueError(
+                "AITER MXFP4/MXFP8 dispatch requires hidden_dim divisible by 32"
+            )
+        if mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_FP8:
+            if not moe_quant_config.use_mxfp4_w4a8:
+                raise ValueError("AITER W4A8 requires an MXFP4 W4A8 quant config")
+            mxfp_dispatch_dtype = dtypes.fp8
+        else:
+            if not moe_quant_config.use_mxfp4_w4a4:
+                raise ValueError("AITER W4A4 requires an MXFP4 W4A4 quant config")
+            if getattr(torch, "float4_e2m1fn_x2", None) != dtypes.fp4x2:
+                raise NotImplementedError(
+                    "AITER MXFP4 dispatch requires native torch FP4 dtype support"
+                )
+            mxfp_dispatch_dtype = dtypes.fp4x2
+    moe_quant_config.dispatch_quant_dtype = mxfp_dispatch_dtype
 
     prepare_finalize = maybe_make_prepare_finalize(
         moe=moe_config,

@@ -1117,6 +1117,21 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.use_ep
         )
 
+    def _defer_input_quant(self) -> bool:
+        """Whether prepare() should hand the dispatcher unquantized input.
+
+        A prepare/finalize that dispatches in an MX dtype quantizes first, so
+        deferring would both double the payload and add a receive-side pass.
+        """
+        use_mx_prequant = (
+            getattr(self.fused_experts.quant_config, "dispatch_quant_dtype", None)
+            is not None
+            and getattr(
+                self.prepare_finalize, "supports_mx_prequantized_inputs", False
+            )
+        )
+        return self.fused_experts.expects_unquantized_inputs and not use_mx_prequant
+
     def _allocate_buffers(
         self,
         out_dtype: torch.dtype,
@@ -1233,7 +1248,7 @@ class FusedMoEKernelModularImpl:
                 expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                defer_input_quant=self._defer_input_quant(),
             )
         else:
             # Overlap shared expert compute with all2all dispatch.
@@ -1246,7 +1261,7 @@ class FusedMoEKernelModularImpl:
                 expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                defer_input_quant=self._defer_input_quant(),
             )
 
             # TODO(lucas): refactor this in the alternative schedules followup
