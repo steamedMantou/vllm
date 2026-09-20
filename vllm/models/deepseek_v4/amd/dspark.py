@@ -44,6 +44,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
@@ -125,6 +126,12 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        self.confidence_head: DSparkConfidenceHead | None = None
+        if getattr(config, "enable_confidence_head", True):
+            self.confidence_head = DSparkConfidenceHead(
+                config.hidden_size + config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "confidence_head"),
+            )
 
         # MHC head CustomOp dispatcher (aiter / tilelang / triton / torch),
         # replacing the direct nvidia tilelang kernel call.
@@ -358,6 +365,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        """Per-position acceptance probability for each drafted token."""
+        assert self.model.confidence_head is not None
+        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+
     # --- Weight loading ----------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -398,11 +412,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         head_start = n_local_head * tp_rank
         head_end = n_local_head * (tp_rank + 1)
 
+        loaded_confidence_head = False
+
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_name(name)
             if mapped is None:
                 continue
             name = mapped
+            if "confidence_head." in name:
+                loaded_confidence_head = True
 
             # ``.scale`` -> per-method scale suffix.
             if name.endswith(".scale"):
@@ -469,6 +487,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        if self.model.confidence_head is not None and not loaded_confidence_head:
+            self.model.confidence_head = None
+
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -482,8 +503,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(m.group(1))
         rest = m.group(2)
-        # The confidence head is not wired into inference yet; drop its weights.
-        if rest.startswith("confidence_head."):
+        # Model-level head; keep it only when the head was actually built.
+        if rest.startswith("confidence_head.") and self.model.confidence_head is None:
             return None
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.
@@ -493,6 +514,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             "hc_head_base",
             "hc_head_scale",
             "markov_head.",
+            "confidence_head.",
         )
         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
             head_prefixes
