@@ -483,6 +483,14 @@ def _supports_varlen_paged_mqa_logits() -> bool:
 
 
 def _supports_flattened_device_query_lens() -> bool:
+    # ROCm has no native multi-row sparse decode kernel (see
+    # _supports_native_decode), so spec decode already flattens every query
+    # into its own single-token row. That layout is built from the device
+    # decode lengths -- the only CPU quantity it needs is the total token
+    # count, which adaptive verification keeps exact -- so a device/CPU
+    # disagreement over the per-request split is harmless here.
+    if current_platform.is_rocm():
+        return True
     return (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(90)

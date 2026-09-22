@@ -394,6 +394,26 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
     reorder_batch_threshold: int | None = None
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_spec: "KVCacheSpec",
+    ) -> AttentionCGSupport:
+        # UNIFORM_BATCH is the conservative label for the fixed next_n batches
+        # spec decode normally submits; nothing in this builder actually needs
+        # it. Every per-token structure it produces is ragged (indices plus an
+        # indptr) and built from the device query_start_loc, and the CPU
+        # quantities it still reads -- the prefill lengths and the
+        # decode_threshold-clamped max_decode_query_len -- are either untouched
+        # by trimming or already upper bounds. Adaptive verification varies
+        # only the per-request split at a fixed token count, so a graph captured
+        # for that token count replays correctly.
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.enable_adaptive_verification:
+            return AttentionCGSupport.ALWAYS
+        return cls._cudagraph_support
     supports_draft_decode_metadata_update = True
 
     def __init__(self, *args, **kwargs):
