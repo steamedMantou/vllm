@@ -135,7 +135,9 @@ class AdaptiveVerificationManager:
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
         self._cudagraph_limit = 0
-        self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+        self._batch_budget: (
+            tuple[dict[str, int], dict[str, int], int, int] | None
+        ) = None
         max_num_reqs = req_states.max_num_reqs
         # Current per-slot confidences
         self._confidence_probs = torch.empty(
@@ -333,8 +335,38 @@ class AdaptiveVerificationManager:
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
             draft_budget,
+            max_draft_budget,
         )
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+
+    def fill_padding(self, num_tokens_after_padding: int) -> int | None:
+        """Raise the budget to fill rows this step already pays for.
+
+        `get_num_tokens` has to choose before two things are known: what token
+        count the DP ranks will agree on, and what captured graph size that
+        rounds up to. Every rank then runs `max(count across DP)` rounded up,
+        so a rank that trimmed below it leaves rows idle in a shape it is
+        paying for either way. Admitting drafts into those rows cannot change
+        which graph replays, so they are free -- take them, best survival
+        first, which `reallocate_drafts` already does.
+
+        Returns the new token count, or None when no budget is pending.
+        """
+        batch_budget = self._batch_budget
+        if batch_budget is None:
+            return None
+        num_drafts, non_draft, draft_budget, max_draft_budget = batch_budget
+        non_draft_total = sum(non_draft.values())
+        free_budget = min(max_draft_budget, num_tokens_after_padding - non_draft_total)
+        if free_budget > draft_budget:
+            draft_budget = free_budget
+            self._batch_budget = (
+                num_drafts,
+                non_draft,
+                draft_budget,
+                max_draft_budget,
+            )
+        return non_draft_total + draft_budget
 
     def compact_batch(
         self,
@@ -350,7 +382,7 @@ class AdaptiveVerificationManager:
         """
         batch_budget = self._batch_budget
         assert batch_budget is not None
-        _, _, draft_budget = batch_budget
+        _, _, draft_budget, _ = batch_budget
         num_drafts = int(num_draft_tokens_per_req.sum())
         if draft_budget == num_drafts:
             return num_scheduled_tokens, cu_num_logits_np
@@ -381,7 +413,9 @@ class AdaptiveVerificationManager:
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         batch_budget, self._batch_budget = self._batch_budget, None
         assert batch_budget is not None
-        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget, _ = (
+            batch_budget
+        )
         num_reqs = idx_mapping.shape[0]
         scheduled_drafts = np.fromiter(
             (num_drafts_per_req[req_id] for req_id in req_ids),

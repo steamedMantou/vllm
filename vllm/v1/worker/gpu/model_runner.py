@@ -1167,6 +1167,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> InputBatch:
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+        if self.adaptive_verification is not None:
+            # The trim was priced before the DP ranks agreed on a token count
+            # and before that rounded up to a captured size. Claim whatever
+            # rows that left idle; see AdaptiveVerificationManager.fill_padding.
+            filled = self.adaptive_verification.fill_padding(num_tokens_after_padding)
+            if filled is not None:
+                num_tokens = filled
         assert num_tokens > 0
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
