@@ -621,7 +621,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
         )
-        if self.adaptive_verification is not None:
+        if (
+            self.adaptive_verification is not None
+            and self.compilation_config.cudagraph_mode.decode_mode()
+            != CUDAGraphMode.FULL
+        ):
+            # Adaptive verification needs FULL decode graphs, because it varies
+            # the per-request split at a fixed token count and only a full graph
+            # replays that. It has no stake in the mixed_mode half: piecewise
+            # graphs for prefill batches are an unrelated optimisation, and
+            # capturing them is not free. Forcing FULL_AND_PIECEWISE
+            # unconditionally took the reserved capture headroom from 1.29 GiB
+            # to 12.88-22.92 GiB per rank on DeepSeek-V4, which comes straight
+            # out of the KV pool. So only raise the decode half, and leave a
+            # mode that already has FULL decode graphs alone.
             self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
